@@ -40,7 +40,7 @@ import io.github.libxposed.api.XposedModule;
  */
 public final class HeyBoxModule extends XposedModule {
     private static final String TAG = "HeyBoxHook";
-    private static final String MODULE_VERSION = "0.5.2";
+    private static final String MODULE_VERSION = "0.5.3";
     private static final String TARGET_PACKAGE = Config.TARGET_PACKAGE;
     private static final String MAIN_ACTIVITY = "com.max.xiaoheihe.MainActivity";
     private static final String TASK_FRAGMENT =
@@ -1127,6 +1127,7 @@ public final class HeyBoxModule extends XposedModule {
     private void installVersionSpoofHooks(ClassLoader classLoader) {
         prepareVersionCheck(classLoader);
         installVersionResponseObserver(classLoader);
+        installUpdatePromptHooks(classLoader);
         installAppVersionUtilityHook(classLoader);
         installAppVersionCodeUtilityHook(classLoader);
         installNetworkVersionIdentityHook(classLoader);
@@ -1290,6 +1291,64 @@ public final class HeyBoxModule extends XposedModule {
             info("HOOK_VERSION_RESPONSE_OK class=" + CHECK_VERSION_OBJECT);
         } catch (Throwable throwable) {
             error("HOOK_VERSION_RESPONSE_ERROR class=" + CHECK_VERSION_OBJECT, throwable);
+        }
+    }
+
+    /**
+     * 屏蔽小黑盒在服务端判断当前版本过旧时创建的升级弹窗。
+     *
+     * AppUpdateManager.i.onNext() 在 force_push=1 时会调用 v()，v() 再调用
+     * w() 创建真正的升级对话框；部分入口会直接调用 w()，测试版提示则走 B()。
+     * 这些方法都是 void，因此直接短路即可，不改变版本接口返回值，也不影响其余
+     * 网络请求和应用内版本伪装逻辑。C() 是下载完成后的“新版本已准备好”对话框，
+     * 一并拦截，避免在其它入口重新显示同一个升级提示。
+     */
+    private void installUpdatePromptHooks(ClassLoader classLoader) {
+        try {
+            Class<?> updateManager = Class.forName(
+                    "com.max.xiaoheihe.utils.AppUpdateManager", false, classLoader);
+            Class<?> appCompatActivity = Class.forName(
+                    "androidx.appcompat.app.AppCompatActivity", false, classLoader);
+            Class<?> versionObject = Class.forName(
+                    CHECK_VERSION_OBJECT, false, classLoader);
+            Class<?> betaTestInfo = Class.forName(
+                    "com.max.xiaoheihe.bean.account.BetaTestInfo", false, classLoader);
+
+            Method showForcedUpdate = updateManager.getMethod(
+                    "v", appCompatActivity, versionObject);
+            hook(showForcedUpdate).intercept(chain -> {
+                info("UPDATE_PROMPT_SUPPRESSED method=AppUpdateManager.v");
+                return null;
+            });
+
+            Method showUpdate = updateManager.getMethod(
+                    "w", appCompatActivity, versionObject, Boolean.class);
+            hook(showUpdate).intercept(chain -> {
+                info("UPDATE_PROMPT_SUPPRESSED method=AppUpdateManager.w");
+                return null;
+            });
+
+            Method showBeta = updateManager.getMethod(
+                    "B", appCompatActivity, betaTestInfo);
+            hook(showBeta).intercept(chain -> {
+                info("UPDATE_PROMPT_SUPPRESSED method=AppUpdateManager.B");
+                return null;
+            });
+
+            try {
+                Method showReady = updateManager.getDeclaredMethod("C");
+                showReady.setAccessible(true);
+                hook(showReady).intercept(chain -> {
+                    info("UPDATE_PROMPT_SUPPRESSED method=AppUpdateManager.C");
+                    return null;
+                });
+            } catch (NoSuchMethodException ignored) {
+                // C() 是当前版本下载完成后的内部方法，旧版不存在时无需失败整个安装。
+                warn("HOOK_UPDATE_PROMPT_SKIP method=AppUpdateManager.C");
+            }
+            info("HOOK_UPDATE_PROMPT_OK methods=AppUpdateManager.v,w,B,C");
+        } catch (Throwable throwable) {
+            error("HOOK_UPDATE_PROMPT_ERROR", throwable);
         }
     }
 
@@ -1760,10 +1819,17 @@ public final class HeyBoxModule extends XposedModule {
     }
 
     /**
-     * 优先使用服务端下发的 report_extra；当前三种任务再按标题映射到应用内置的
-     * link、game_detail、game_comment。后续出现相同类别的新任务也无需改类名 Hook。
+     * 先按任务标题识别用户可见的任务类型，再读取 report_extra 作为其它任务的
+     * 服务端提示。游戏评价任务的 report_extra 在部分响应中会复用 game_detail
+     * 或通用 link；如果先信任它，/share/behavior/success 会带错 src，服务端就
+     * 不会把这一次上报计入“分享游戏评价”。标题是该任务最稳定的判别依据。
      */
     private String resolveShareSource(String title, Object reportExtra) {
+        String titleSource = resolveTitleShareSource(title);
+        if (!titleSource.isEmpty()) {
+            return titleSource;
+        }
+
         for (String key : new String[]{"src", "share_src", "share_source", "page_type"}) {
             String value = readJsonString(reportExtra, key);
             if (isKnownShareSource(value)) {
@@ -1778,6 +1844,12 @@ public final class HeyBoxModule extends XposedModule {
             }
         }
 
+        // 没有标题时，继续使用 report_extra 中的嵌套值；未知任务最终按 link
+        // 处理，保持对未来新增分享任务的兼容。
+        return "link";
+    }
+
+    private String resolveTitleShareSource(String title) {
         String text = title == null ? "" : title;
         if (text.contains("游戏详情")) {
             return "game_detail";
@@ -1807,9 +1879,7 @@ public final class HeyBoxModule extends XposedModule {
         if (text.contains("话题")) {
             return "hashtag_share";
         }
-
-        // “分享任意内容”等泛化任务按当前客户端最常见的帖子分享来源处理。
-        return "link";
+        return "";
     }
 
     private String readJsonString(Object jsonObject, String key) {
