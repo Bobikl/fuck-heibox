@@ -20,14 +20,17 @@ public final class ConfigReceiver extends BroadcastReceiver {
         }
 
         long versionCode = intent.getLongExtra(Config.EXTRA_LATEST_VERSION_CODE, 0L);
+        // versionName 和 versionCode 必须成对缓存；只收到名称时不能覆盖旧的
+        // versionCode，否则自动模式会把不同版本的两个标识拼在一起。
+        if (!isPlausibleVersionCode(versionCode)) {
+            return;
+        }
 
         android.content.SharedPreferences.Editor editor = context
                 .getSharedPreferences(Config.PREFS_NAME, Context.MODE_PRIVATE)
                 .edit()
-                .putString(Config.KEY_LATEST_VERSION, version.trim());
-        if (versionCode > 0L) {
-            editor.putLong(Config.KEY_LATEST_VERSION_CODE, versionCode);
-        }
+                .putString(Config.KEY_LATEST_VERSION, version.trim())
+                .putLong(Config.KEY_LATEST_VERSION_CODE, versionCode);
         editor.apply();
     }
 
@@ -38,5 +41,9 @@ public final class ConfigReceiver extends BroadcastReceiver {
         String text = value.trim();
         return !text.isEmpty() && text.length() <= 64
                 && text.matches("[0-9A-Za-z._+\\-]+");
+    }
+
+    private static boolean isPlausibleVersionCode(long value) {
+        return value > 0L && value <= 0x00000000ffffffffL;
     }
 }

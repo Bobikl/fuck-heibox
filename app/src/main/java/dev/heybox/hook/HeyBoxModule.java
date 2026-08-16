@@ -43,7 +43,7 @@ import io.github.libxposed.api.XposedModule;
  */
 public final class HeyBoxModule extends XposedModule {
     private static final String TAG = "HeyBoxHook";
-    private static final String MODULE_VERSION = "0.5.5";
+    private static final String MODULE_VERSION = "0.5.6";
     private static final String TARGET_PACKAGE = Config.TARGET_PACKAGE;
     private static final String MAIN_ACTIVITY = "com.max.xiaoheihe.MainActivity";
     private static final String TASK_FRAGMENT =
@@ -105,6 +105,8 @@ public final class HeyBoxModule extends XposedModule {
     private volatile boolean dailyShareFetchRequested;
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
     private final Map<Object, Runnable> pendingTaskRefreshes = new WeakHashMap<>();
+    private final Map<Activity, List<WeakReference<View>>> centerNavigationViews =
+            new WeakHashMap<>();
     private volatile Resources centerNavigationResources;
     private volatile int[] centerNavigationIds;
     private String currentProcessName = "";
@@ -257,12 +259,32 @@ public final class HeyBoxModule extends XposedModule {
             }
             int changed = 0;
             int found = 0;
-            for (int id : ids) {
-                if (id == 0) {
-                    continue;
+            List<WeakReference<View>> cachedViews;
+            synchronized (centerNavigationViews) {
+                cachedViews = centerNavigationViews.get(activity);
+                boolean resolveViews = cachedViews == null
+                        || cachedViews.size() != ids.length;
+                if (!resolveViews) {
+                    for (WeakReference<View> reference : cachedViews) {
+                        View cached = reference == null ? null : reference.get();
+                        if (cached == null || !cached.isAttachedToWindow()) {
+                            resolveViews = true;
+                            break;
+                        }
+                    }
                 }
+                if (resolveViews) {
+                    cachedViews = new ArrayList<>(ids.length);
+                    for (int id : ids) {
+                        View view = id == 0 ? null : activity.findViewById(id);
+                        cachedViews.add(new WeakReference<>(view));
+                    }
+                    centerNavigationViews.put(activity, cachedViews);
+                }
+            }
 
-                View view = activity.findViewById(id);
+            for (WeakReference<View> reference : cachedViews) {
+                View view = reference == null ? null : reference.get();
                 if (view == null) {
                     continue;
                 }
@@ -1560,9 +1582,22 @@ public final class HeyBoxModule extends XposedModule {
                     "com.max.xiaoheihe.router.serviceimpl.i", false, classLoader);
             Class<?> urlBuilder = Class.forName("okhttp3.t$a", false, classLoader);
             Method appendQuery = findTwoStringFluentMethod(urlBuilder, "c");
+            Method replaceQuery;
+            try {
+                // 当前 OkHttp Builder.W() 会先删除同名参数，再写入未编码值；使用它
+                // 避免原拦截器的 version/build 与伪装值同时出现在 URL 中。
+                replaceQuery = findTwoStringFluentMethod(urlBuilder, "W");
+            } catch (NoSuchMethodException ignored) {
+                // 旧版 Builder 没有 R() 时回退到原有追加方法。
+                replaceQuery = null;
+            }
             Method configure = interceptor.getDeclaredMethod(
                     "b", urlBuilder, String.class);
             appendQuery.setAccessible(true);
+            if (replaceQuery != null) {
+                replaceQuery.setAccessible(true);
+            }
+            final Method queryMethod = replaceQuery == null ? appendQuery : replaceQuery;
             configure.setAccessible(true);
             hook(configure).intercept(chain -> {
                 Object result = chain.proceed();
@@ -1578,10 +1613,8 @@ public final class HeyBoxModule extends XposedModule {
                             ? "0.0.0" : resolveSpoofVersion("1.3.347");
                     long versionCode = diagnosticVersionRequest
                             ? 1L : resolveSpoofVersionCode(916L);
-                    appendQuery.invoke(builder, "version",
-                            version);
-                    appendQuery.invoke(builder, "build", String.valueOf(
-                            versionCode));
+                    queryMethod.invoke(builder, "version", version);
+                    queryMethod.invoke(builder, "build", String.valueOf(versionCode));
                     if (diagnosticVersionRequest) {
                         info("VERSION_CHECK_IDENTITY endpoint=" + endpoint
                                 + " version=" + version + " build=" + versionCode);
@@ -1589,7 +1622,8 @@ public final class HeyBoxModule extends XposedModule {
                 }
                 return result;
             });
-            info("HOOK_NETWORK_VERSION_OK method=router.serviceimpl.i.b params=version,build");
+            info("HOOK_NETWORK_VERSION_OK method=router.serviceimpl.i.b params=version,build"
+                    + " replace=" + (replaceQuery != null));
         } catch (Throwable throwable) {
             error("HOOK_NETWORK_VERSION_ERROR method=router.serviceimpl.i.b", throwable);
         }
@@ -1676,25 +1710,10 @@ public final class HeyBoxModule extends XposedModule {
             return;
         }
         latestServerVersion = value;
-        cachedLatestVersionSnapshot = value;
-        refreshEffectiveVersionSnapshot();
         info("VERSION_LATEST_DETECTED version=" + value);
-
-        Context context = targetContext;
-        if (context == null) {
-            return;
-        }
-        try {
-            Intent intent = new Intent(Config.ACTION_CACHE_LATEST_VERSION);
-            intent.setComponent(new ComponentName(
-                    Config.MODULE_PACKAGE, Config.MODULE_PACKAGE + ".ConfigReceiver"));
-            intent.setData(android.net.Uri.parse("heyboxhook://cache/" + value));
-            intent.putExtra(Config.EXTRA_LATEST_VERSION, value);
-            context.sendBroadcast(intent);
-        } catch (Throwable throwable) {
-            warn("VERSION_CACHE_BROADCAST_ERROR "
-                    + throwable.getClass().getSimpleName() + ":" + throwable.getMessage());
-        }
+        // version_control_info 只返回 versionName，没有对应的 versionCode；不把
+        // 它写入持久缓存，避免自动模式复用旧编号造成成对标识错配。设置页的
+        // 小米商店接口会同时写入两个字段，作为自动伪装的可靠来源。
     }
 
     private static boolean isVersionCheckEndpoint(String endpoint) {
