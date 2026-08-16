@@ -5,6 +5,7 @@ import android.content.ComponentName;
 import android.content.Context;
 import android.content.Intent;
 import android.content.SharedPreferences;
+import android.content.res.Resources;
 import android.content.pm.PackageInfo;
 import android.os.Build;
 import android.os.Bundle;
@@ -32,6 +33,8 @@ import java.util.IdentityHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Set;
+import java.util.Map;
+import java.util.WeakHashMap;
 
 import io.github.libxposed.api.XposedModule;
 
@@ -40,7 +43,7 @@ import io.github.libxposed.api.XposedModule;
  */
 public final class HeyBoxModule extends XposedModule {
     private static final String TAG = "HeyBoxHook";
-    private static final String MODULE_VERSION = "0.5.4";
+    private static final String MODULE_VERSION = "0.5.5";
     private static final String TARGET_PACKAGE = Config.TARGET_PACKAGE;
     private static final String MAIN_ACTIVITY = "com.max.xiaoheihe.MainActivity";
     private static final String TASK_FRAGMENT =
@@ -95,8 +98,15 @@ public final class HeyBoxModule extends XposedModule {
     private volatile long customVersionCodeSnapshot;
     private volatile String cachedLatestVersionSnapshot = "";
     private volatile long cachedLatestVersionCodeSnapshot;
+    /** 版本拦截热路径使用的基准值缓存（目标 APK 当前真实值为 1.3.347/916）。 */
+    private volatile String effectiveVersionSnapshot = "1.3.347";
+    private volatile long effectiveVersionCodeSnapshot = 916L;
     private volatile boolean dailyShareInProgress;
     private volatile boolean dailyShareFetchRequested;
+    private final Handler mainHandler = new Handler(Looper.getMainLooper());
+    private final Map<Object, Runnable> pendingTaskRefreshes = new WeakHashMap<>();
+    private volatile Resources centerNavigationResources;
+    private volatile int[] centerNavigationIds;
     private String currentProcessName = "";
 
     @Override
@@ -229,10 +239,25 @@ public final class HeyBoxModule extends XposedModule {
         }
 
         try {
+            Resources resources = activity.getResources();
+            int[] ids = centerNavigationIds;
+            if (ids == null || centerNavigationResources != resources) {
+                synchronized (this) {
+                    ids = centerNavigationIds;
+                    if (ids == null || centerNavigationResources != resources) {
+                        ids = new int[CENTER_VIEW_NAMES.length];
+                        for (int index = 0; index < CENTER_VIEW_NAMES.length; index++) {
+                            ids[index] = resources.getIdentifier(
+                                    CENTER_VIEW_NAMES[index], "id", TARGET_PACKAGE);
+                        }
+                        centerNavigationResources = resources;
+                        centerNavigationIds = ids;
+                    }
+                }
+            }
             int changed = 0;
             int found = 0;
-            for (String name : CENTER_VIEW_NAMES) {
-                int id = activity.getResources().getIdentifier(name, "id", TARGET_PACKAGE);
+            for (int id : ids) {
                 if (id == 0) {
                     continue;
                 }
@@ -336,14 +361,10 @@ public final class HeyBoxModule extends XposedModule {
             Method getReportExtra = taskClass.getMethod("getReport_extra");
             Method reportTaskClick = fragmentClass.getMethod("N3", fragmentClass, taskClass);
             Method getTaskShareListener = fragmentClass.getMethod("b4", fragmentClass);
-            // onRefresh() 会先调用 showLoading()，导致整个任务页闪烁。直接调用其内部
-            // u4() 只在后台重新请求任务数据，不显示全屏 Loading。
-            Method silentRefreshTasks = fragmentClass.getDeclaredMethod("u4");
             Field fragmentField = adapterClass.getDeclaredField("b");
 
             bind.setAccessible(true);
             findView.setAccessible(true);
-            silentRefreshTasks.setAccessible(true);
             fragmentField.setAccessible(true);
 
             hook(bind).intercept(chain -> {
@@ -423,17 +444,9 @@ public final class HeyBoxModule extends XposedModule {
                                     + " src=" + source
                                     + " media=" + media);
 
-                            // success 事件是立即上报；稍后静默拉取服务端状态。这里不能调用
-                            // onRefresh()，否则会显示全屏 Loading，造成整个页面一闪而过。
-                            view.postDelayed(() -> {
-                                try {
-                                    silentRefreshTasks.invoke(fragment);
-                                    info("TASK_SILENT_REFRESH_OK title=" + title);
-                                } catch (Throwable throwable) {
-                                    warn("TASK_SILENT_REFRESH_ERROR title=" + title + " error="
-                                            + unwrap(throwable).getClass().getSimpleName());
-                                }
-                            }, 2500L);
+                            // success 事件是立即上报；稍后静默拉取服务端状态。多个
+                            // 任务连续完成时只保留最后一次刷新，避免重复 u4() 请求。
+                            scheduleSilentTaskRefresh(fragment, "TASK");
                         } catch (Throwable throwable) {
                             error("TASK_SHARE_REPORT_ERROR title=" + title,
                                     unwrap(throwable));
@@ -889,21 +902,48 @@ public final class HeyBoxModule extends XposedModule {
                 + " all_completed=" + allCompleted
                 + " exp=" + exp + " coin=" + coin);
 
-        // 等待服务端处理 success 事件后静默刷新，更新任务页状态但不触发全屏 Loading。
+        // 等待服务端处理 success 事件后静默拉取一次任务状态；与手动任务共用
+        // 防抖队列，不触发全屏 Loading。
+        scheduleSilentTaskRefresh(fragment, "DAILY");
+    }
+
+    /** 将同一个任务页在短时间内的多次刷新合并为一次 u4() 请求。 */
+    private void scheduleSilentTaskRefresh(Object fragment, String source) {
         if (fragment == null) {
             return;
         }
-        new Handler(Looper.getMainLooper()).postDelayed(() -> {
-            try {
-                Method refresh = fragment.getClass().getDeclaredMethod("u4");
-                refresh.setAccessible(true);
-                refresh.invoke(fragment);
-                info("DAILY_TASK_SILENT_REFRESH_OK");
-            } catch (Throwable throwable) {
-                warn("DAILY_TASK_SILENT_REFRESH_ERROR error="
-                        + unwrap(throwable).getClass().getSimpleName());
+        WeakReference<Object> fragmentReference = new WeakReference<>(fragment);
+        final Runnable[] refreshHolder = new Runnable[1];
+        Runnable refresh = () -> {
+            Object target = fragmentReference.get();
+            if (target == null) {
+                return;
             }
-        }, 2500L);
+            try {
+                Method method = target.getClass().getDeclaredMethod("u4");
+                method.setAccessible(true);
+                method.invoke(target);
+                info(source + "_TASK_SILENT_REFRESH_OK");
+            } catch (Throwable throwable) {
+                warn(source + "_TASK_SILENT_REFRESH_ERROR error="
+                        + unwrap(throwable).getClass().getSimpleName());
+            } finally {
+                synchronized (pendingTaskRefreshes) {
+                    if (pendingTaskRefreshes.get(target) == refreshHolder[0]) {
+                        pendingTaskRefreshes.remove(target);
+                    }
+                }
+            }
+        };
+        refreshHolder[0] = refresh;
+
+        synchronized (pendingTaskRefreshes) {
+            Runnable previous = pendingTaskRefreshes.put(fragment, refresh);
+            if (previous != null) {
+                mainHandler.removeCallbacks(previous);
+            }
+            mainHandler.postDelayed(refresh, 2500L);
+        }
     }
 
     private Object createSilentShareListener(ClassLoader classLoader) throws Throwable {
@@ -1608,8 +1648,12 @@ public final class HeyBoxModule extends XposedModule {
                 method.setAccessible(true);
                 hook(method).intercept(chain -> {
                     Object result = chain.proceed();
-                    String packageName = stringValue(chain.getArg(0));
-                    if (TARGET_PACKAGE.equals(packageName) && result instanceof PackageInfo) {
+                    if (!spoofVersionSnapshot
+                            || !TARGET_PACKAGE.equals(chain.getArg(0))
+                            || !(result instanceof PackageInfo)) {
+                        return result;
+                    }
+                    if (result instanceof PackageInfo) {
                         PackageInfo packageInfo = (PackageInfo) result;
                         packageInfo.versionName = resolveSpoofVersion(packageInfo.versionName);
                         long realVersionCode = getPackageVersionCode(packageInfo);
@@ -1633,6 +1677,7 @@ public final class HeyBoxModule extends XposedModule {
         }
         latestServerVersion = value;
         cachedLatestVersionSnapshot = value;
+        refreshEffectiveVersionSnapshot();
         info("VERSION_LATEST_DETECTED version=" + value);
 
         Context context = targetContext;
@@ -1712,6 +1757,11 @@ public final class HeyBoxModule extends XposedModule {
             return real;
         }
 
+        if ("1.3.347".equals(real)
+                && isPlausibleVersion(effectiveVersionSnapshot)) {
+            return effectiveVersionSnapshot;
+        }
+
         String mode = versionModeSnapshot;
         if (Config.VERSION_MODE_CUSTOM.equals(mode)) {
             String custom = customVersionSnapshot;
@@ -1733,6 +1783,10 @@ public final class HeyBoxModule extends XposedModule {
         if (!spoofVersionSnapshot) {
             return realVersionCode;
         }
+
+        if (realVersionCode == 916L && isPlausibleVersionCode(effectiveVersionCodeSnapshot)) {
+            return effectiveVersionCodeSnapshot;
+        }
         if (Config.VERSION_MODE_CUSTOM.equals(versionModeSnapshot)) {
             return isPlausibleVersionCode(customVersionCodeSnapshot)
                     ? customVersionCodeSnapshot : realVersionCode;
@@ -1741,6 +1795,37 @@ public final class HeyBoxModule extends XposedModule {
         // versionCode 单调递增；更新应用后不使用更低的旧缓存。
         return isPlausibleVersionCode(latestCode) && latestCode >= realVersionCode
                 ? latestCode : realVersionCode;
+    }
+
+    /** 预计算目标 APK 当前基准版本的伪装结果，减少网络拦截器中的重复比较。 */
+    private void refreshEffectiveVersionSnapshot() {
+        String effectiveName = "1.3.347";
+        long effectiveCode = 916L;
+        if (!spoofVersionSnapshot) {
+            effectiveVersionSnapshot = effectiveName;
+            effectiveVersionCodeSnapshot = effectiveCode;
+            return;
+        }
+        if (Config.VERSION_MODE_CUSTOM.equals(versionModeSnapshot)) {
+            if (isPlausibleVersion(customVersionSnapshot)) {
+                effectiveName = customVersionSnapshot;
+            }
+            if (isPlausibleVersionCode(customVersionCodeSnapshot)) {
+                effectiveCode = customVersionCodeSnapshot;
+            }
+        } else {
+            if (isPlausibleVersion(cachedLatestVersionSnapshot)
+                    && isPlausibleVersionCode(cachedLatestVersionCodeSnapshot)
+                    && compareVersions(cachedLatestVersionSnapshot, "1.3.347") >= 0) {
+                effectiveName = cachedLatestVersionSnapshot;
+            }
+            if (isPlausibleVersionCode(cachedLatestVersionCodeSnapshot)
+                    && cachedLatestVersionCodeSnapshot >= 916L) {
+                effectiveCode = cachedLatestVersionCodeSnapshot;
+            }
+        }
+        effectiveVersionSnapshot = effectiveName;
+        effectiveVersionCodeSnapshot = effectiveCode;
     }
 
     @SuppressWarnings("deprecation")
@@ -1777,6 +1862,7 @@ public final class HeyBoxModule extends XposedModule {
                 Config.KEY_LATEST_VERSION, "").trim();
         cachedLatestVersionCodeSnapshot = getPreferenceLong(
                 Config.KEY_LATEST_VERSION_CODE, 0L);
+        refreshEffectiveVersionSnapshot();
         info("VERSION_CONFIG_READY enabled=" + spoofVersionSnapshot
                 + " mode=" + versionModeSnapshot
                 + " cached=" + cachedLatestVersionSnapshot
