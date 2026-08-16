@@ -12,6 +12,8 @@ public final class Config {
     public static final String KEY_DAILY_SHARE_TASK = "daily_share_task";
     public static final String KEY_SKIP_SPLASH_AD = "skip_splash_ad";
     public static final String KEY_SPOOF_VERSION = "spoof_version";
+    /** 是否拦截小黑盒检测到旧版本后创建的升级提示。 */
+    public static final String KEY_SUPPRESS_UPDATE_PROMPT = "suppress_update_prompt";
     public static final String KEY_VERSION_MODE = "version_mode";
     public static final String KEY_CUSTOM_VERSION = "custom_version";
     public static final String KEY_CUSTOM_VERSION_CODE = "custom_version_code";

@@ -40,7 +40,7 @@ import io.github.libxposed.api.XposedModule;
  */
 public final class HeyBoxModule extends XposedModule {
     private static final String TAG = "HeyBoxHook";
-    private static final String MODULE_VERSION = "0.5.3";
+    private static final String MODULE_VERSION = "0.5.4";
     private static final String TARGET_PACKAGE = Config.TARGET_PACKAGE;
     private static final String MAIN_ACTIVITY = "com.max.xiaoheihe.MainActivity";
     private static final String TASK_FRAGMENT =
@@ -71,6 +71,9 @@ public final class HeyBoxModule extends XposedModule {
     private static final int CURRENT_TASK_STATE_CONTAINER_ID = 0x7f0a14c0;
     private static final String DAILY_RUNTIME_PREFS = "heybox_hook_runtime";
     private static final String DAILY_SHARE_DATE = "daily_share_date";
+    private static final long DAILY_SHARE_START_DELAY_MS = 3500L;
+    private static final long DAILY_SHARE_RETRY_DELAY_MS = 5000L;
+    private static final int DAILY_SHARE_MAX_FETCH_ATTEMPTS = 2;
 
     private static final String[] CENTER_VIEW_NAMES = {
             "vg_mid_tab",
@@ -115,6 +118,12 @@ public final class HeyBoxModule extends XposedModule {
             return;
         }
 
+        boolean mainProcess = TARGET_PACKAGE.equals(currentProcessName);
+        if (!mainProcess) {
+            info("PROCESS_SKIP process=" + currentProcessName);
+            return;
+        }
+
         synchronized (this) {
             if (hooksInstalled) {
                 return;
@@ -125,12 +134,6 @@ public final class HeyBoxModule extends XposedModule {
         ClassLoader classLoader = param.getClassLoader();
         info("PKG_READY package=" + param.getPackageName()
                 + " loader=" + classLoader.getClass().getName());
-
-        boolean mainProcess = TARGET_PACKAGE.equals(currentProcessName);
-        if (!mainProcess) {
-            info("PROCESS_SKIP process=" + currentProcessName);
-            return;
-        }
 
         loadVersionConfigSnapshot();
 
@@ -171,7 +174,6 @@ public final class HeyBoxModule extends XposedModule {
                 // Activity 完成初始化后再触发内部检查，避免更新管理器拿到未完成
                 // 初始化的上下文；SplashActivity 深链路径仍由其自身 Hook 处理。
                 handleVersionCheckRequest(activity);
-                triggerDailyShareFetch(classLoader);
                 return result;
             });
 
@@ -181,6 +183,9 @@ public final class HeyBoxModule extends XposedModule {
                 if (isEnabled(Config.KEY_HIDE_PUBLISH, true)) {
                     hideCenterNavigation((Activity) chain.getThisObject(), "onResume");
                 }
+                // onCreate 时应用的登录态和网络组件可能尚未准备好。等首页真正
+                // resume 后再请求任务列表，避免只有进入“我的任务”页面才触发 n4。
+                triggerDailyShareFetch(classLoader);
                 return result;
             });
 
@@ -362,13 +367,16 @@ public final class HeyBoxModule extends XposedModule {
                     String state = stringValue(getState.invoke(task));
                     String stateDesc = stringValue(getStateDesc.invoke(task));
                     String url = stringValue(getUrl.invoke(task));
-                    Object reportExtra = getReportExtra.invoke(task);
-                    String source = resolveShareSource(title, reportExtra);
 
                     // 已完成和待领奖按钮保留原行为，只接管仍需“去完成”的任务。
                     if ("finish".equals(state) || "can_reward".equals(state)) {
                         return result;
                     }
+
+                    // report_extra 解析和 source 映射只对仍需完成的分享任务执行，
+                    // 避免 Adapter 每次绑定已完成任务时重复反射解析 JSON。
+                    Object reportExtra = getReportExtra.invoke(task);
+                    String source = resolveShareSource(title, reportExtra);
 
                     View stateContainer = findTaskStateView(holder, findView, "vg_state",
                             CURRENT_TASK_STATE_CONTAINER_ID);
@@ -469,111 +477,166 @@ public final class HeyBoxModule extends XposedModule {
         }
     }
 
-    /** 主界面启动时直接请求任务接口；用户不必先进入“我的任务”页面。 */
+    /**
+     * 首页稳定 resume 后直接请求任务接口；不再依赖用户进入“我的任务”页面。
+     * 请求链复用原生 u4() 的 IO/Main 调度，失败时只做一次有限重试。
+     */
     private void triggerDailyShareFetch(ClassLoader classLoader) {
         if (!isEnabled(Config.KEY_DAILY_SHARE_TASK, true)
-                || !isEnabled(Config.KEY_SHARE_TASK, true)
-                || dailyShareFetchRequested) {
+                || !isEnabled(Config.KEY_SHARE_TASK, true)) {
             return;
         }
         Context context = targetContext;
         if (context == null) {
             return;
         }
-        String day = new SimpleDateFormat("yyyy-MM-dd", Locale.ROOT)
-                .format(new Date());
+        String day = currentDay();
         if (day.equals(context.getSharedPreferences(
                 DAILY_RUNTIME_PREFS, Context.MODE_PRIVATE)
                 .getString(DAILY_SHARE_DATE, ""))) {
             return;
         }
-        dailyShareFetchRequested = true;
-        new Handler(Looper.getMainLooper()).postDelayed(() -> {
-            try {
-                Class<?> networkFactory = Class.forName(
-                        "com.max.xiaoheihe.network.i", false, classLoader);
-                Object service = networkFactory.getMethod("a").invoke(null);
-                Class<?> serviceClass = Class.forName(
-                        "com.max.xiaoheihe.network.e", false, classLoader);
-                Object observable = serviceClass.getMethod("ib").invoke(service);
-                Class<?> observerClass = Class.forName("io.reactivex.g0", false, classLoader);
-                Object observer = Proxy.newProxyInstance(classLoader,
-                        new Class<?>[]{observerClass}, (proxy, method, args) -> {
-                            String name = method.getName();
-                            if ("onNext".equals(name) && args != null && args.length > 0) {
-                                Object envelope = args[0];
-                                Object value = envelope;
-                                try {
-                                    Method getResult = envelope.getClass().getMethod("getResult");
-                                    value = getResult.invoke(envelope);
-                                } catch (Throwable ignored) {
-                                    // 某些网络层直接回调 TaskResultObj。
-                                }
-                                Object taskResult = value;
-                                new Handler(Looper.getMainLooper()).post(() ->
-                                        scheduleDailyShareTasks(null, taskResult, classLoader));
-                            } else if ("onError".equals(name)) {
-                                Throwable error = args != null && args.length > 0
-                                        && args[0] instanceof Throwable
-                                        ? (Throwable) args[0] : null;
-                                warn("DAILY_TASK_FETCH_ERROR "
-                                        + (error == null ? "unknown" : error.getMessage()));
-                            }
-                            return null;
-                        });
-                Method subscribe = observable.getClass().getMethod(
-                        "J5", observerClass);
-                subscribe.invoke(observable, observer);
-                info("DAILY_TASK_FETCH_REQUEST_OK endpoint=/task/list_v2/");
-            } catch (Throwable throwable) {
-                dailyShareFetchRequested = false;
-                error("DAILY_TASK_FETCH_REQUEST_ERROR", unwrap(throwable));
+        synchronized (this) {
+            if (dailyShareFetchRequested || dailyShareInProgress) {
+                return;
             }
-        }, 1200L);
+            dailyShareFetchRequested = true;
+        }
+        new Handler(Looper.getMainLooper()).postDelayed(
+                () -> requestDailyShareList(classLoader, day, 1),
+                DAILY_SHARE_START_DELAY_MS);
+        info("DAILY_TASK_FETCH_SCHEDULED day=" + day
+                + " delay_ms=" + DAILY_SHARE_START_DELAY_MS);
     }
 
-    private void scheduleDailyShareTasks(Object fragment, Object taskResult,
-                                         ClassLoader classLoader) {
-        if (taskResult == null || dailyShareInProgress) {
+    private void requestDailyShareList(ClassLoader classLoader, String day, int attempt) {
+        if (!dailyShareFetchRequested) {
             return;
+        }
+        try {
+            Class<?> networkFactory = Class.forName(
+                    "com.max.xiaoheihe.network.i", false, classLoader);
+            Object service = networkFactory.getMethod("a").invoke(null);
+            Class<?> serviceClass = Class.forName(
+                    "com.max.xiaoheihe.network.e", false, classLoader);
+            Object observable = serviceClass.getMethod("ib").invoke(service);
+
+            // UserTaskFragmentV2.u4() 使用同样的 RxJava 调度。原先直接 J5()
+            // 订阅会让启动请求时序不稳定，且可能把网络工作落到主线程。
+            Class<?> schedulerClass = Class.forName(
+                    "io.reactivex.h0", false, classLoader);
+            Object ioScheduler = Class.forName(
+                    "io.reactivex.schedulers.b", false, classLoader)
+                    .getMethod("d").invoke(null);
+            observable = observable.getClass().getMethod(
+                    "I5", schedulerClass).invoke(observable, ioScheduler);
+            Object mainScheduler = Class.forName(
+                    "io.reactivex.android.schedulers.a", false, classLoader)
+                    .getMethod("c").invoke(null);
+            observable = observable.getClass().getMethod(
+                    "a4", schedulerClass).invoke(observable, mainScheduler);
+
+            Class<?> observerClass = Class.forName("io.reactivex.g0", false, classLoader);
+            Object observer = Proxy.newProxyInstance(classLoader,
+                    new Class<?>[]{observerClass}, (proxy, method, args) -> {
+                        String name = method.getName();
+                        if ("onNext".equals(name) && args != null && args.length > 0) {
+                            Object envelope = args[0];
+                            Object value = envelope;
+                            try {
+                                Method getResult = envelope == null ? null
+                                        : envelope.getClass().getMethod("getResult");
+                                if (getResult != null) {
+                                    value = getResult.invoke(envelope);
+                                }
+                            } catch (Throwable ignored) {
+                                // 某些网络层直接回调 TaskResultObj。
+                            }
+                            Object taskResult = value;
+                            new Handler(Looper.getMainLooper()).post(() -> {
+                                boolean handled = scheduleDailyShareTasks(
+                                        null, taskResult, classLoader);
+                                if (!handled) {
+                                    scheduleDailyShareRetry(classLoader, day, attempt,
+                                            "invalid_or_unhandled_result");
+                                }
+                            });
+                        } else if ("onError".equals(name)) {
+                            Throwable fetchError = args != null && args.length > 0
+                                    && args[0] instanceof Throwable
+                                    ? (Throwable) args[0] : null;
+                            scheduleDailyShareRetry(classLoader, day, attempt,
+                                    fetchError == null ? "unknown" : fetchError.getMessage());
+                        }
+                        return null;
+                    });
+            Method subscribe = observable.getClass().getMethod(
+                    "J5", observerClass);
+            subscribe.invoke(observable, observer);
+            info("DAILY_TASK_FETCH_REQUEST_OK endpoint=/task/list_v2/ attempt=" + attempt);
+        } catch (Throwable throwable) {
+            scheduleDailyShareRetry(classLoader, day, attempt,
+                    unwrap(throwable).getClass().getSimpleName());
+            error("DAILY_TASK_FETCH_REQUEST_ERROR attempt=" + attempt, unwrap(throwable));
+        }
+    }
+
+    private void scheduleDailyShareRetry(ClassLoader classLoader, String day,
+                                          int attempt, String reason) {
+        warn("DAILY_TASK_FETCH_ERROR attempt=" + attempt + " reason=" + reason);
+        if (attempt >= DAILY_SHARE_MAX_FETCH_ATTEMPTS) {
+            dailyShareFetchRequested = false;
+            warn("DAILY_TASK_FETCH_GIVE_UP day=" + day);
+            return;
+        }
+        new Handler(Looper.getMainLooper()).postDelayed(
+                () -> requestDailyShareList(classLoader, day, attempt + 1),
+                DAILY_SHARE_RETRY_DELAY_MS);
+    }
+
+    private boolean scheduleDailyShareTasks(Object fragment, Object taskResult,
+                                            ClassLoader classLoader) {
+        if (taskResult == null || dailyShareInProgress) {
+            return false;
         }
 
         try {
             Context context = fragment == null ? targetContext : getFragmentContext(fragment);
             if (context == null) {
                 warn("DAILY_TASK_SKIP reason=context_missing");
-                return;
+                return false;
             }
 
+            String day = currentDay();
             List<Object> tasks = collectShareTasks(taskResult);
             if (tasks.isEmpty()) {
+                markDailyShareDay(context, day);
+                dailyShareFetchRequested = false;
                 info("DAILY_TASK_SKIP reason=no_pending_share_task");
-                return;
+                return true;
             }
             info("DAILY_TASK_DISCOVERED count=" + tasks.size()
                     + " titles=" + taskTitles(tasks));
 
-            String day = new SimpleDateFormat("yyyy-MM-dd", Locale.ROOT)
-                    .format(new Date());
             synchronized (this) {
                 if (dailyShareInProgress) {
-                    return;
+                    return false;
                 }
                 SharedPreferences runtime = context.getSharedPreferences(
                         DAILY_RUNTIME_PREFS, Context.MODE_PRIVATE);
                 if (day.equals(runtime.getString(DAILY_SHARE_DATE, ""))) {
+                    dailyShareFetchRequested = false;
                     info("DAILY_TASK_SKIP reason=already_run day=" + day);
-                    return;
+                    return true;
                 }
-                // 先占用当天标记，防止同一个响应链或多次刷新重复触发；任务上报
-                // 失败时也不在当天重放，避免服务端收到重复成功事件。
-                runtime.edit().putString(DAILY_SHARE_DATE, day).apply();
+                // 不在任务真正上报前写入日期；进程被杀或网络失败时，下一次启动
+                // 仍可重试，而 dailyShareInProgress 负责阻止当前响应链重复执行。
                 dailyShareInProgress = true;
             }
 
             info("DAILY_TASK_START day=" + day + " count=" + tasks.size());
             Handler handler = new Handler(Looper.getMainLooper());
-            DailyShareSummary summary = new DailyShareSummary(tasks.size());
+            DailyShareSummary summary = new DailyShareSummary(tasks.size(), day);
             for (int index = 0; index < tasks.size(); index++) {
                 final Object task = tasks.get(index);
                 final int taskIndex = index;
@@ -583,10 +646,24 @@ public final class HeyBoxModule extends XposedModule {
             }
             handler.postDelayed(() -> finishDailyShareTasks(
                     fragment, summary, context), tasks.size() * 450L + 350L);
+            return true;
         } catch (Throwable throwable) {
             dailyShareInProgress = false;
             error("DAILY_TASK_SCHEDULE_ERROR", unwrap(throwable));
+            return false;
         }
+    }
+
+    private void markDailyShareDay(Context context, String day) {
+        if (context == null || day == null || day.isEmpty()) {
+            return;
+        }
+        context.getSharedPreferences(DAILY_RUNTIME_PREFS, Context.MODE_PRIVATE)
+                .edit().putString(DAILY_SHARE_DATE, day).apply();
+    }
+
+    private static String currentDay() {
+        return new SimpleDateFormat("yyyy-MM-dd", Locale.ROOT).format(new Date());
     }
 
     private Context getFragmentContext(Object fragment) {
@@ -790,6 +867,13 @@ public final class HeyBoxModule extends XposedModule {
             coin = summary.coin;
         }
         dailyShareInProgress = false;
+        boolean allCompleted = completed >= summary.scheduled;
+        if (allCompleted && completed > 0) {
+            markDailyShareDay(context, summary.day);
+        }
+        // 请求已经结束，允许下一次启动在部分任务失败时重试；完整成功或空列表
+        // 会由日期标记阻止同一天重复请求。
+        dailyShareFetchRequested = false;
         if (completed <= 0) {
             warn("DAILY_TASK_FINISH completed=0");
             return;
@@ -801,6 +885,8 @@ public final class HeyBoxModule extends XposedModule {
                         completed, exp, coin),
                 Toast.LENGTH_SHORT).show();
         info("DAILY_TASK_FINISH completed=" + completed
+                + " scheduled=" + summary.scheduled
+                + " all_completed=" + allCompleted
                 + " exp=" + exp + " coin=" + coin);
 
         // 等待服务端处理 success 事件后静默刷新，更新任务页状态但不触发全屏 Loading。
@@ -902,12 +988,14 @@ public final class HeyBoxModule extends XposedModule {
 
     private static final class DailyShareSummary {
         final int scheduled;
+        final String day;
         int completed;
         long exp;
         long coin;
 
-        DailyShareSummary(int scheduled) {
+        DailyShareSummary(int scheduled, String day) {
             this.scheduled = scheduled;
+            this.day = day;
         }
     }
 
@@ -1217,6 +1305,7 @@ public final class HeyBoxModule extends XposedModule {
                 // 主动诊断请求期间保留服务端 need_update 原值，否则始终改成 0
                 // 会让测试看起来像“请求成功但没有任何更新结果”。
                 return isEnabled(Config.KEY_SPOOF_VERSION, true)
+                        && isEnabled(Config.KEY_SUPPRESS_UPDATE_PROMPT, true)
                         && !forceLegacyVersionForCheck ? "0" : result;
             });
 
@@ -1285,6 +1374,12 @@ public final class HeyBoxModule extends XposedModule {
                         showVersionCheckToast("版本检测失败：" + errorMessage(error));
                         return null;
                     }
+                    if (isEnabled(Config.KEY_SUPPRESS_UPDATE_PROMPT, true)) {
+                        // 普通版本请求失败时，基础 Observer 也可能创建“请升级”
+                        // 错误弹窗；独立开关开启时一并吞掉该 UI 错误链。
+                        info("VERSION_RESPONSE_ERROR_SUPPRESSED");
+                        return null;
+                    }
                 }
                 return chain.proceed();
             });
@@ -1317,6 +1412,9 @@ public final class HeyBoxModule extends XposedModule {
             Method showForcedUpdate = updateManager.getMethod(
                     "v", appCompatActivity, versionObject);
             hook(showForcedUpdate).intercept(chain -> {
+                if (!isEnabled(Config.KEY_SUPPRESS_UPDATE_PROMPT, true)) {
+                    return chain.proceed();
+                }
                 info("UPDATE_PROMPT_SUPPRESSED method=AppUpdateManager.v");
                 return null;
             });
@@ -1324,6 +1422,9 @@ public final class HeyBoxModule extends XposedModule {
             Method showUpdate = updateManager.getMethod(
                     "w", appCompatActivity, versionObject, Boolean.class);
             hook(showUpdate).intercept(chain -> {
+                if (!isEnabled(Config.KEY_SUPPRESS_UPDATE_PROMPT, true)) {
+                    return chain.proceed();
+                }
                 info("UPDATE_PROMPT_SUPPRESSED method=AppUpdateManager.w");
                 return null;
             });
@@ -1331,6 +1432,9 @@ public final class HeyBoxModule extends XposedModule {
             Method showBeta = updateManager.getMethod(
                     "B", appCompatActivity, betaTestInfo);
             hook(showBeta).intercept(chain -> {
+                if (!isEnabled(Config.KEY_SUPPRESS_UPDATE_PROMPT, true)) {
+                    return chain.proceed();
+                }
                 info("UPDATE_PROMPT_SUPPRESSED method=AppUpdateManager.B");
                 return null;
             });
@@ -1339,6 +1443,9 @@ public final class HeyBoxModule extends XposedModule {
                 Method showReady = updateManager.getDeclaredMethod("C");
                 showReady.setAccessible(true);
                 hook(showReady).intercept(chain -> {
+                    if (!isEnabled(Config.KEY_SUPPRESS_UPDATE_PROMPT, true)) {
+                        return chain.proceed();
+                    }
                     info("UPDATE_PROMPT_SUPPRESSED method=AppUpdateManager.C");
                     return null;
                 });

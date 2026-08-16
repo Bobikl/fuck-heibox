@@ -144,6 +144,10 @@ public final class SettingsActivity extends Activity {
                 "伪装应用版本", "对小黑盒自身的版本读取返回目标版本",
                 Config.KEY_SPOOF_VERSION, true));
         versionCard.addView(createDivider());
+        versionCard.addView(createSwitchRow(
+                "屏蔽版本更新弹窗", "检测到当前版本过旧时不显示升级提示",
+                Config.KEY_SUPPRESS_UPDATE_PROMPT, true));
+        versionCard.addView(createDivider());
         versionCard.addView(createVersionModeRow());
         versionCard.addView(createDivider());
         versionStatus = createInfoRow("当前目标", "");
