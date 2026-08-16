@@ -43,7 +43,7 @@ import io.github.libxposed.api.XposedModule;
  */
 public final class HeyBoxModule extends XposedModule {
     private static final String TAG = "HeyBoxHook";
-    private static final String MODULE_VERSION = "0.5.6";
+    private static final String MODULE_VERSION = "0.5.7";
     private static final String TARGET_PACKAGE = Config.TARGET_PACKAGE;
     private static final String MAIN_ACTIVITY = "com.max.xiaoheihe.MainActivity";
     private static final String TASK_FRAGMENT =
@@ -77,6 +77,7 @@ public final class HeyBoxModule extends XposedModule {
     private static final long DAILY_SHARE_START_DELAY_MS = 3500L;
     private static final long DAILY_SHARE_RETRY_DELAY_MS = 5000L;
     private static final int DAILY_SHARE_MAX_FETCH_ATTEMPTS = 2;
+    private static final boolean VERBOSE_TASK_LOG = false;
 
     private static final String[] CENTER_VIEW_NAMES = {
             "vg_mid_tab",
@@ -377,9 +378,7 @@ public final class HeyBoxModule extends XposedModule {
             Method findView = holderClass.getMethod("i", int.class);
             Method getTitle = taskClass.getMethod("getTitle");
             Method getType = taskClass.getMethod("getType");
-            Method getUrl = taskClass.getMethod("getUrl");
             Method getState = taskClass.getMethod("getState");
-            Method getStateDesc = taskClass.getMethod("getState_desc");
             Method getReportExtra = taskClass.getMethod("getReport_extra");
             Method reportTaskClick = fragmentClass.getMethod("N3", fragmentClass, taskClass);
             Method getTaskShareListener = fragmentClass.getMethod("b4", fragmentClass);
@@ -408,8 +407,6 @@ public final class HeyBoxModule extends XposedModule {
                     }
 
                     String state = stringValue(getState.invoke(task));
-                    String stateDesc = stringValue(getStateDesc.invoke(task));
-                    String url = stringValue(getUrl.invoke(task));
 
                     // 已完成和待领奖按钮保留原行为，只接管仍需“去完成”的任务。
                     if ("finish".equals(state) || "can_reward".equals(state)) {
@@ -427,21 +424,21 @@ public final class HeyBoxModule extends XposedModule {
                         return result;
                     }
 
-                    String buttonText = readTaskButtonText(holder, findView);
                     Object fragment = fragmentField.get(chain.getThisObject());
                     if (fragment == null) {
                         warn("TASK_BIND_SKIP reason=fragment_missing title=" + title);
                         return result;
                     }
 
-                    info("TASK_BIND_MATCH title=" + title
-                            + " type=" + type
-                            + " state=" + state
-                            + " state_desc=" + stateDesc
-                            + " button=" + buttonText
-                            + " url=" + url
-                            + " src=" + source
-                            + " report_extra=" + stringValue(reportExtra));
+                    // 任务 Adapter 会频繁绑定；不在生产热路径输出完整 JSON 和 URL。
+                    if (VERBOSE_TASK_LOG) {
+                        String buttonText = readTaskButtonText(holder, findView);
+                        info("TASK_BIND_MATCH title=" + title
+                                + " type=" + type
+                                + " state=" + state
+                                + " button=" + buttonText
+                                + " src=" + source);
+                    }
 
                     stateContainer.setClickable(true);
                     stateContainer.setOnClickListener(view -> {
