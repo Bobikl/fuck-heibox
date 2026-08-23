@@ -61,6 +61,8 @@ public final class SettingsActivity extends Activity {
     private TextView versionModeValue;
     private TextView versionStatus;
     private TextView selfCheckStatus;
+    private TextView adCleanValue;
+    private View imageAdaptiveContainer;
     private LinearLayout customVersionRow;
     private EditText customVersionInput;
     private EditText customVersionCodeInput;
@@ -73,6 +75,7 @@ public final class SettingsActivity extends Activity {
         configureWindow();
         setContentView(createPage());
         refreshVersionArea();
+        refreshAdCleanValue();
     }
 
     @Override
@@ -83,6 +86,9 @@ public final class SettingsActivity extends Activity {
         }
         if (selfCheckStatus != null) {
             refreshSelfCheck();
+        }
+        if (adCleanValue != null) {
+            refreshAdCleanValue();
         }
     }
 
@@ -149,9 +155,7 @@ public final class SettingsActivity extends Activity {
                 "隐藏首页发布按钮", "移除底部导航栏中间的发布入口",
                  Config.KEY_HIDE_PUBLISH, false));
         cleanCard.addView(createDivider());
-        cleanCard.addView(createSwitchRow(
-                "全局广告净化", "移除信息流、首页气泡/角标、页内弹层及商城底栏广告",
-                 Config.KEY_GLOBAL_AD_CLEAN, false));
+        cleanCard.addView(createAdCleanRow());
         cleanCard.addView(createDivider());
         cleanCard.addView(createSwitchRow(
                 "跳过开屏广告", "独立于全局净化；保留启动流程并跳过广告素材",
@@ -173,11 +177,15 @@ public final class SettingsActivity extends Activity {
                  Config.KEY_DAILY_SHARE_TASK, false));
         content.addView(taskCard, cardMargins());
 
-        addSectionLabel("浏览与媒体");
+        addSectionLabel("浏览、阅读与媒体");
         LinearLayout experienceCard = createCard();
         experienceCard.addView(createSwitchRow(
                 "使用外部浏览器打开链接", "普通 http/https 链接交给外部浏览器，内部协议保留",
                  Config.KEY_EXTERNAL_BROWSER, false));
+        experienceCard.addView(createDivider());
+        experienceCard.addView(createSwitchRow(
+                "强制开启帖子正文文字选择", "只作用于帖子正文渲染器，不修改评论和其它页面",
+                 Config.KEY_POST_TEXT_SELECT, false));
         experienceCard.addView(createDivider());
         experienceCard.addView(createSwitchRow(
                 "禁止视频/GIF 自动播放", "推荐流视频保留手动播放；GIF 默认显示静态首帧",
@@ -188,8 +196,23 @@ public final class SettingsActivity extends Activity {
                  Config.KEY_NO_FOREGROUND_REFRESH, false));
         experienceCard.addView(createDivider());
         experienceCard.addView(createSwitchRow(
-                "图片体验增强", "进入图片查看器后自动请求服务器原图",
-                 Config.KEY_IMAGE_ENHANCE, false));
+                "图片查看器自动加载原图", "进入图片查看器后自动请求服务器原图",
+                 Config.KEY_IMAGE_ENHANCE, false, checked -> {
+                     if (imageAdaptiveContainer != null) {
+                         imageAdaptiveContainer.setVisibility(
+                                 checked ? View.VISIBLE : View.GONE);
+                     }
+                 }));
+        LinearLayout adaptiveContainer = new LinearLayout(this);
+        adaptiveContainer.setOrientation(LinearLayout.VERTICAL);
+        adaptiveContainer.addView(createDivider());
+        adaptiveContainer.addView(createSwitchRow(
+                "根据网络自适应查看原图", "Wi-Fi 自动加载原图；移动网络保持普通图片",
+                Config.KEY_IMAGE_WIFI_ADAPTIVE, false));
+        imageAdaptiveContainer = adaptiveContainer;
+        adaptiveContainer.setVisibility(preferences.getBoolean(
+                Config.KEY_IMAGE_ENHANCE, false) ? View.VISIBLE : View.GONE);
+        experienceCard.addView(adaptiveContainer);
         content.addView(experienceCard, cardMargins());
 
         addSectionLabel("版本兼容");
@@ -283,6 +306,60 @@ public final class SettingsActivity extends Activity {
         action.setPadding(dp(16), dp(12), dp(16), dp(12));
         action.setMinimumHeight(dp(48));
         return action;
+    }
+
+    private View createAdCleanRow() {
+        LinearLayout row = createBaseRow();
+        row.setClickable(true);
+        row.setFocusable(true);
+
+        LinearLayout textColumn = createTextColumn(
+                "全局广告净化", "进入二级页面选择需要净化的广告类型");
+        row.addView(textColumn, new LinearLayout.LayoutParams(0,
+                ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+
+        adCleanValue = new TextView(this);
+        adCleanValue.setTextColor(COLOR_SECONDARY);
+        adCleanValue.setTextSize(13);
+        adCleanValue.setGravity(Gravity.CENTER_VERTICAL | Gravity.END);
+        row.addView(adCleanValue, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, dp(52)));
+
+        TextView arrow = new TextView(this);
+        arrow.setText("  ›");
+        arrow.setTextColor(Color.rgb(188, 190, 196));
+        arrow.setTextSize(26);
+        arrow.setGravity(Gravity.CENTER);
+        row.addView(arrow, new LinearLayout.LayoutParams(dp(22), dp(52)));
+        row.setOnClickListener(view -> {
+            startActivity(new Intent(this, AdSettingsActivity.class));
+            overridePendingTransition(0, 0);
+        });
+        return row;
+    }
+
+    private void refreshAdCleanValue() {
+        if (adCleanValue == null) {
+            return;
+        }
+        if (!preferences.getBoolean(Config.KEY_GLOBAL_AD_CLEAN, false)) {
+            adCleanValue.setText("未开启");
+            return;
+        }
+        int enabled = 0;
+        if (preferences.getBoolean(Config.KEY_AD_CLEAN_FEED, true)) {
+            enabled++;
+        }
+        if (preferences.getBoolean(Config.KEY_AD_CLEAN_HOME, true)) {
+            enabled++;
+        }
+        if (preferences.getBoolean(Config.KEY_AD_CLEAN_BANNERS, true)) {
+            enabled++;
+        }
+        if (preferences.getBoolean(Config.KEY_AD_CLEAN_MALL_BOTTOM, true)) {
+            enabled++;
+        }
+        adCleanValue.setText("已开启 · " + enabled + "项");
     }
 
     @SuppressWarnings("deprecation")
@@ -527,6 +604,13 @@ public final class SettingsActivity extends Activity {
     @SuppressWarnings("deprecation")
     private View createSwitchRow(String title, String subtitle, String key,
                                  boolean defaultValue) {
+        return createSwitchRow(title, subtitle, key, defaultValue, null);
+    }
+
+    @SuppressWarnings("deprecation")
+    private View createSwitchRow(String title, String subtitle, String key,
+                                 boolean defaultValue,
+                                 ToggleChangeListener changeListener) {
         LinearLayout row = createBaseRow();
         LinearLayout textColumn = createTextColumn(title, subtitle);
         row.addView(textColumn, new LinearLayout.LayoutParams(0,
@@ -541,12 +625,20 @@ public final class SettingsActivity extends Activity {
         toggle.setThumbTintList(new android.content.res.ColorStateList(
                 new int[][]{new int[]{android.R.attr.state_checked}, new int[]{}},
                 new int[]{COLOR_ACCENT, Color.WHITE}));
-        toggle.setOnCheckedChangeListener((button, checked) ->
-                preferences.edit().putBoolean(key, checked).apply());
+        toggle.setOnCheckedChangeListener((button, checked) -> {
+            preferences.edit().putBoolean(key, checked).apply();
+            if (changeListener != null) {
+                changeListener.onChanged(checked);
+            }
+        });
         row.setOnClickListener(view -> toggle.setChecked(!toggle.isChecked()));
         row.addView(toggle, new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT));
         return row;
+    }
+
+    private interface ToggleChangeListener {
+        void onChanged(boolean checked);
     }
 
     private View createVersionModeRow() {

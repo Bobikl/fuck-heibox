@@ -12,6 +12,9 @@ import android.content.res.Resources;
 import android.content.pm.PackageInfo;
 import android.content.pm.ResolveInfo;
 import android.net.Uri;
+import android.net.ConnectivityManager;
+import android.net.Network;
+import android.net.NetworkCapabilities;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
@@ -105,11 +108,17 @@ public final class HeyBoxModule extends XposedModule {
     private volatile boolean dailyShareTaskSnapshot;
     private volatile boolean skipSplashAdSnapshot;
     private volatile boolean globalAdCleanSnapshot;
+    private volatile boolean adCleanFeedSnapshot;
+    private volatile boolean adCleanHomeSnapshot;
+    private volatile boolean adCleanBannersSnapshot;
+    private volatile boolean adCleanMallBottomSnapshot;
     private volatile boolean disableClipboardTokenSnapshot;
     private volatile boolean externalBrowserSnapshot;
     private volatile boolean disableMediaAutoplaySnapshot;
     private volatile boolean noForegroundRefreshSnapshot;
     private volatile boolean imageEnhanceSnapshot;
+    private volatile boolean imageWifiAdaptiveSnapshot;
+    private volatile boolean postTextSelectSnapshot;
     private volatile boolean suppressUpdatePromptSnapshot;
     private volatile boolean spoofVersionSnapshot;
     private volatile String versionModeSnapshot = Config.VERSION_MODE_AUTO;
@@ -195,7 +204,10 @@ public final class HeyBoxModule extends XposedModule {
         if (skipSplashAdSnapshot) {
             installSplashAdHook(classLoader);
         }
-        if (globalAdCleanSnapshot) {
+        if (globalAdCleanSnapshot && (adCleanFeedSnapshot
+                || adCleanHomeSnapshot
+                || adCleanBannersSnapshot
+                || adCleanMallBottomSnapshot)) {
             installGlobalAdHooks(classLoader);
         }
         if (disableClipboardTokenSnapshot) {
@@ -212,6 +224,9 @@ public final class HeyBoxModule extends XposedModule {
         }
         if (imageEnhanceSnapshot) {
             installImageEnhancementHook(classLoader);
+        }
+        if (postTextSelectSnapshot) {
+            installPostTextSelectionHook(classLoader);
         }
     }
 
@@ -1328,104 +1343,127 @@ public final class HeyBoxModule extends XposedModule {
      */
     private void installGlobalAdHooks(ClassLoader classLoader) {
         int installed = 0;
-        try {
-            Class<?> mainActivity = Class.forName(MAIN_ACTIVITY, false, classLoader);
-            Class<?> innerAd = Class.forName(
-                    "com.max.xiaoheihe.bean.InnerAdsInfoObj", false, classLoader);
-            Method loadInnerAds = mainActivity.getDeclaredMethod("K2");
-            Method showInnerAd = mainActivity.getDeclaredMethod("V3", innerAd);
-            Method showBubbleAd = mainActivity.getDeclaredMethod("S2");
-            loadInnerAds.setAccessible(true);
-            showInnerAd.setAccessible(true);
-            showBubbleAd.setAccessible(true);
-            hook(loadInnerAds).intercept(chain -> null);
-            hook(showInnerAd).intercept(chain -> null);
-            hook(showBubbleAd).intercept(chain -> null);
-            installed += 3;
-        } catch (Throwable throwable) {
-            warn("AD_MAIN_HOOK_SKIP reason="
-                    + unwrap(throwable).getClass().getSimpleName());
-        }
-
-        installed += hookConstantNoArgGetter(classLoader,
-                "com.max.xiaoheihe.bean.AdsInfosObj", "getInner_ads",
-                Collections.emptyList());
-        installed += hookConstantNoArgGetter(classLoader,
-                "com.max.xiaoheihe.bean.ads.OverallAdInfo", "getBubble_ad", null);
-        installed += hookConstantNoArgGetter(classLoader,
-                "com.max.xiaoheihe.bean.ads.OverallAdInfo", "getHome_corner_ad", null);
-        installed += hookConstantNoArgGetter(classLoader,
-                "com.max.xiaoheihe.bean.bbs.FeedsContentAdObj", "getBanners",
-                Collections.emptyList());
-        String[][] bannerGetters = {
-                {"com.max.xiaoheihe.bean.bbs.BBSTopicLinksObj", "getBanner"},
-                {"com.max.xiaoheihe.bean.bbs.BbsRecommendObj", "getBanner"},
-                {"com.max.xiaoheihe.bean.bbs.BBSTopicBannerResult", "getAds_banner"},
-                {"com.max.xiaoheihe.bean.bbs.HashtagLinkListResultObj", "getAds_banner"},
-                {"com.max.xiaoheihe.bean.account.SignInResultObj", "getAds_banner"},
-                {"com.max.xiaoheihe.bean.game.gameoverview.GameOverviewBannerObj", "getAd_list"},
-                {"com.max.xiaoheihe.bean.trade.TradeSteamInventoryResult", "getBanner"},
-                {"com.max.xiaoheihe.bean.mall.MallHeaderObj", "getBanners"},
-                {"com.max.xiaoheihe.bean.mall.MallProductObj", "getBanners"}
-        };
-        for (String[] target : bannerGetters) {
-            installed += hookConstantNoArgGetter(
-                    classLoader, target[0], target[1], Collections.emptyList());
-        }
-
-        try {
-            Class<?> manager = Class.forName(
-                    "com.max.xiaoheihe.module.mall.BottomBarManager", false, classLoader);
-            Class<?> protocol = Class.forName(
-                    "com.max.xiaoheihe.bean.WebProtocolObj", false, classLoader);
-            Class<?> notificationType = Class.forName(
-                    "com.max.xiaoheihe.module.mall.NotificationType",
-                    false, classLoader);
-            Method showBottomAd = manager.getDeclaredMethod("c", View.class,
-                    protocol, Context.class, int.class, notificationType);
-            showBottomAd.setAccessible(true);
-            hook(showBottomAd).intercept(chain -> null);
-            installed++;
-        } catch (Throwable throwable) {
-            warn("AD_MALL_HOOK_SKIP reason="
-                    + unwrap(throwable).getClass().getSimpleName());
-        }
-
-        try {
-            Class<?> feedsAd = Class.forName(
-                    "com.max.xiaoheihe.bean.bbs.FeedsContentAdObj", false, classLoader);
-            String[][] feedGetters = {
-                    {"com.max.xiaoheihe.bean.news.LinkListResultObj", "getLinks"},
-                    {"com.max.xiaoheihe.bean.bbs.BBSTopicLinksObj", "getLinks"},
-                    {"com.max.xiaoheihe.bean.bbs.HashtagLinkListResultObj", "getLinks"},
-                    {"com.max.xiaoheihe.bean.bbs.BBSFollowedMomentsObj", "getMoments"},
-                    {"com.max.xiaoheihe.bean.bbs.ProfileEventResult", "getMoments"},
-                    {"com.max.xiaoheihe.bean.news.SubjectDetailResultOjb", "getNews_list"},
-                    {"com.max.xiaoheihe.bean.news.ConceptFeedsResult", "getLinks"},
-                    {"com.max.xiaoheihe.bean.bbs.BbsRecommendObj", "getLinks"},
-                    {"com.max.xiaoheihe.bean.bbs.CollectionFolder", "getLinks"},
-                    {"com.max.xiaoheihe.bean.bbs.RecallFeedsResult", "getVisible_links"},
-                    {"com.max.xiaoheihe.bean.bbs.RecallFeedsResult", "getUnexposed_links"}
-            };
-            for (String[] target : feedGetters) {
-                try {
-                    Class<?> owner = Class.forName(target[0], false, classLoader);
-                    Method getter = owner.getMethod(target[1]);
-                    hook(getter).intercept(chain ->
-                            filterFeedAds(chain.proceed(), feedsAd));
-                    installed++;
-                } catch (Throwable throwable) {
-                    warn("AD_FEED_GETTER_SKIP method=" + target[0] + "." + target[1]
-                            + " reason=" + unwrap(throwable).getClass().getSimpleName());
-                }
+        if (adCleanHomeSnapshot) {
+            int categoryInstalled = 0;
+            try {
+                Class<?> mainActivity = Class.forName(MAIN_ACTIVITY, false, classLoader);
+                Class<?> innerAd = Class.forName(
+                        "com.max.xiaoheihe.bean.InnerAdsInfoObj", false, classLoader);
+                Method loadInnerAds = mainActivity.getDeclaredMethod("K2");
+                Method showInnerAd = mainActivity.getDeclaredMethod("V3", innerAd);
+                Method showBubbleAd = mainActivity.getDeclaredMethod("S2");
+                loadInnerAds.setAccessible(true);
+                showInnerAd.setAccessible(true);
+                showBubbleAd.setAccessible(true);
+                hook(loadInnerAds).intercept(chain -> null);
+                hook(showInnerAd).intercept(chain -> null);
+                hook(showBubbleAd).intercept(chain -> null);
+                categoryInstalled += 3;
+            } catch (Throwable throwable) {
+                warn("AD_MAIN_HOOK_SKIP reason="
+                        + unwrap(throwable).getClass().getSimpleName());
             }
-        } catch (Throwable throwable) {
-            warn("AD_FEED_CLASS_SKIP reason="
-                    + unwrap(throwable).getClass().getSimpleName());
+            categoryInstalled += hookConstantNoArgGetter(classLoader,
+                    "com.max.xiaoheihe.bean.AdsInfosObj", "getInner_ads",
+                    Collections.emptyList());
+            categoryInstalled += hookConstantNoArgGetter(classLoader,
+                    "com.max.xiaoheihe.bean.ads.OverallAdInfo", "getBubble_ad", null);
+            categoryInstalled += hookConstantNoArgGetter(classLoader,
+                    "com.max.xiaoheihe.bean.ads.OverallAdInfo", "getHome_corner_ad", null);
+            installed += categoryInstalled;
+            if (categoryInstalled > 0) {
+                recordHookGroup("广告/首页与页内");
+            }
+        }
+
+        if (adCleanFeedSnapshot) {
+            int categoryInstalled = hookConstantNoArgGetter(classLoader,
+                    "com.max.xiaoheihe.bean.bbs.FeedsContentAdObj", "getBanners",
+                    Collections.emptyList());
+            try {
+                Class<?> feedsAd = Class.forName(
+                        "com.max.xiaoheihe.bean.bbs.FeedsContentAdObj", false, classLoader);
+                String[][] feedGetters = {
+                        {"com.max.xiaoheihe.bean.news.LinkListResultObj", "getLinks"},
+                        {"com.max.xiaoheihe.bean.bbs.BBSTopicLinksObj", "getLinks"},
+                        {"com.max.xiaoheihe.bean.bbs.HashtagLinkListResultObj", "getLinks"},
+                        {"com.max.xiaoheihe.bean.bbs.BBSFollowedMomentsObj", "getMoments"},
+                        {"com.max.xiaoheihe.bean.bbs.ProfileEventResult", "getMoments"},
+                        {"com.max.xiaoheihe.bean.news.SubjectDetailResultOjb", "getNews_list"},
+                        {"com.max.xiaoheihe.bean.news.ConceptFeedsResult", "getLinks"},
+                        {"com.max.xiaoheihe.bean.bbs.BbsRecommendObj", "getLinks"},
+                        {"com.max.xiaoheihe.bean.bbs.CollectionFolder", "getLinks"},
+                        {"com.max.xiaoheihe.bean.bbs.RecallFeedsResult", "getVisible_links"},
+                        {"com.max.xiaoheihe.bean.bbs.RecallFeedsResult", "getUnexposed_links"}
+                };
+                for (String[] target : feedGetters) {
+                    try {
+                        Class<?> owner = Class.forName(target[0], false, classLoader);
+                        Method getter = owner.getMethod(target[1]);
+                        hook(getter).intercept(chain ->
+                                filterFeedAds(chain.proceed(), feedsAd));
+                        categoryInstalled++;
+                    } catch (Throwable throwable) {
+                        warn("AD_FEED_GETTER_SKIP method=" + target[0] + "." + target[1]
+                                + " reason=" + unwrap(throwable).getClass().getSimpleName());
+                    }
+                }
+            } catch (Throwable throwable) {
+                warn("AD_FEED_CLASS_SKIP reason="
+                        + unwrap(throwable).getClass().getSimpleName());
+            }
+            installed += categoryInstalled;
+            if (categoryInstalled > 0) {
+                recordHookGroup("广告/信息流对象");
+            }
+        }
+
+        if (adCleanBannersSnapshot) {
+            int categoryInstalled = 0;
+            String[][] bannerGetters = {
+                    {"com.max.xiaoheihe.bean.bbs.BBSTopicLinksObj", "getBanner"},
+                    {"com.max.xiaoheihe.bean.bbs.BbsRecommendObj", "getBanner"},
+                    {"com.max.xiaoheihe.bean.bbs.BBSTopicBannerResult", "getAds_banner"},
+                    {"com.max.xiaoheihe.bean.bbs.HashtagLinkListResultObj", "getAds_banner"},
+                    {"com.max.xiaoheihe.bean.account.SignInResultObj", "getAds_banner"},
+                    {"com.max.xiaoheihe.bean.game.gameoverview.GameOverviewBannerObj", "getAd_list"},
+                    {"com.max.xiaoheihe.bean.trade.TradeSteamInventoryResult", "getBanner"},
+                    {"com.max.xiaoheihe.bean.mall.MallHeaderObj", "getBanners"},
+                    {"com.max.xiaoheihe.bean.mall.MallProductObj", "getBanners"}
+            };
+            for (String[] target : bannerGetters) {
+                categoryInstalled += hookConstantNoArgGetter(
+                        classLoader, target[0], target[1], Collections.emptyList());
+            }
+            installed += categoryInstalled;
+            if (categoryInstalled > 0) {
+                recordHookGroup("广告/横幅");
+            }
+        }
+
+        if (adCleanMallBottomSnapshot) {
+            try {
+                Class<?> manager = Class.forName(
+                        "com.max.xiaoheihe.module.mall.BottomBarManager", false, classLoader);
+                Class<?> protocol = Class.forName(
+                        "com.max.xiaoheihe.bean.WebProtocolObj", false, classLoader);
+                Class<?> notificationType = Class.forName(
+                        "com.max.xiaoheihe.module.mall.NotificationType",
+                        false, classLoader);
+                Method showBottomAd = manager.getDeclaredMethod("c", View.class,
+                        protocol, Context.class, int.class, notificationType);
+                showBottomAd.setAccessible(true);
+                hook(showBottomAd).intercept(chain -> null);
+                installed++;
+                recordHookGroup("广告/商城底栏");
+            } catch (Throwable throwable) {
+                warn("AD_MALL_HOOK_SKIP reason="
+                        + unwrap(throwable).getClass().getSimpleName());
+            }
         }
 
         if (installed > 0) {
-            recordHookGroup("全局广告净化");
+            recordHookGroup("广告净化");
             info("HOOK_GLOBAL_AD_OK methods=" + installed);
         } else {
             warn("HOOK_GLOBAL_AD_EMPTY");
@@ -1708,6 +1746,10 @@ public final class HeyBoxModule extends XposedModule {
                         && Boolean.FALSE.equals(isOriginal.invoke(data))
                         && !stringValue(getOriginalUrl.invoke(data)).isEmpty()
                         && originalButton.hasOnClickListeners()) {
+                    if (imageWifiAdaptiveSnapshot
+                            && !hasUsableWifi(originalButton.getContext())) {
+                        return result;
+                    }
                     synchronized (requestedOriginalImages) {
                         if (!requestedOriginalImages.add(data)) {
                             return result;
@@ -1721,6 +1763,86 @@ public final class HeyBoxModule extends XposedModule {
             info("HOOK_IMAGE_ENHANCE_OK method=BaseResUICustomizer.K");
         } catch (Throwable throwable) {
             error("HOOK_IMAGE_ENHANCE_ERROR", throwable);
+        }
+    }
+
+    /** 网络状态只在图片查看器准备自动加载原图时读取，不监听网络变化。 */
+    private static boolean hasUsableWifi(Context context) {
+        if (context == null) {
+            return false;
+        }
+        try {
+            ConnectivityManager manager = (ConnectivityManager)
+                    context.getSystemService(Context.CONNECTIVITY_SERVICE);
+            if (manager == null) {
+                return false;
+            }
+            Network active = manager.getActiveNetwork();
+            NetworkCapabilities activeCapabilities = active == null
+                    ? null : manager.getNetworkCapabilities(active);
+            if (hasWifiInternet(activeCapabilities)) {
+                return true;
+            }
+            if (activeCapabilities == null
+                    || !activeCapabilities.hasTransport(
+                    NetworkCapabilities.TRANSPORT_VPN)) {
+                // 移动网络是当前默认网络时，即使后台还挂着非默认 Wi-Fi，
+                // 也必须按流量网络处理，不能自动加载原图。
+                return false;
+            }
+            // VPN 是默认网络时，公开 SDK 无法直接读取其底层网络，只在这个
+            // 低频路径中扫描已连接网络以判断 VPN 是否运行于 Wi-Fi 之上。
+            for (Network network : manager.getAllNetworks()) {
+                if (hasWifiInternet(manager.getNetworkCapabilities(network))) {
+                    return true;
+                }
+            }
+        } catch (Throwable ignored) {
+            // 无权限或系统网络服务异常时按非 Wi-Fi 处理，避免误用流量加载原图。
+        }
+        return false;
+    }
+
+    private static boolean hasWifiInternet(NetworkCapabilities capabilities) {
+        return capabilities != null
+                && capabilities.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)
+                && capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET);
+    }
+
+    /**
+     * 只处理 PostUtils.Companion.a() 在帖子正文容器中新加入的直属 TextView。
+     * 评论、消息、用户资料和其它 ExpressionTextView 均不经过这个渲染器。
+     */
+    private void installPostTextSelectionHook(ClassLoader classLoader) {
+        try {
+            Class<?> renderer = Class.forName(
+                    "com.max.xiaoheihe.module.bbs.post.utils.PostUtils$Companion",
+                    false, classLoader);
+            Class<?> linkInfo = Class.forName(
+                    "com.max.xiaoheihe.bean.bbs.LinkInfoObj", false, classLoader);
+            Method renderBody = renderer.getMethod("a", Activity.class,
+                    android.view.LayoutInflater.class, List.class,
+                    ViewGroup.class, linkInfo, boolean.class);
+            hook(renderBody).intercept(chain -> {
+                ViewGroup body = (ViewGroup) chain.getArg(3);
+                int previousChildren = body == null ? 0 : body.getChildCount();
+                Object result = chain.proceed();
+                if (body == null) {
+                    return result;
+                }
+                int childCount = body.getChildCount();
+                for (int index = previousChildren; index < childCount; index++) {
+                    View child = body.getChildAt(index);
+                    if (child instanceof TextView) {
+                        ((TextView) child).setTextIsSelectable(true);
+                    }
+                }
+                return result;
+            });
+            recordHookGroup("帖子正文文字选择");
+            info("HOOK_POST_TEXT_SELECT_OK method=PostUtils.Companion.a");
+        } catch (Throwable throwable) {
+            error("HOOK_POST_TEXT_SELECT_ERROR", throwable);
         }
     }
 
@@ -2451,6 +2573,14 @@ public final class HeyBoxModule extends XposedModule {
         dailyShareTaskSnapshot = isEnabled(Config.KEY_DAILY_SHARE_TASK, false);
         skipSplashAdSnapshot = isEnabled(Config.KEY_SKIP_SPLASH_AD, false);
         globalAdCleanSnapshot = isEnabled(Config.KEY_GLOBAL_AD_CLEAN, false);
+        adCleanFeedSnapshot = globalAdCleanSnapshot
+                && isEnabled(Config.KEY_AD_CLEAN_FEED, true);
+        adCleanHomeSnapshot = globalAdCleanSnapshot
+                && isEnabled(Config.KEY_AD_CLEAN_HOME, true);
+        adCleanBannersSnapshot = globalAdCleanSnapshot
+                && isEnabled(Config.KEY_AD_CLEAN_BANNERS, true);
+        adCleanMallBottomSnapshot = globalAdCleanSnapshot
+                && isEnabled(Config.KEY_AD_CLEAN_MALL_BOTTOM, true);
         disableClipboardTokenSnapshot = isEnabled(
                 Config.KEY_DISABLE_CLIPBOARD_TOKEN, false);
         externalBrowserSnapshot = isEnabled(Config.KEY_EXTERNAL_BROWSER, false);
@@ -2459,6 +2589,9 @@ public final class HeyBoxModule extends XposedModule {
         noForegroundRefreshSnapshot = isEnabled(
                 Config.KEY_NO_FOREGROUND_REFRESH, false);
         imageEnhanceSnapshot = isEnabled(Config.KEY_IMAGE_ENHANCE, false);
+        imageWifiAdaptiveSnapshot = imageEnhanceSnapshot
+                && isEnabled(Config.KEY_IMAGE_WIFI_ADAPTIVE, false);
+        postTextSelectSnapshot = isEnabled(Config.KEY_POST_TEXT_SELECT, false);
         suppressUpdatePromptSnapshot = isEnabled(
                 Config.KEY_SUPPRESS_UPDATE_PROMPT, false);
         spoofVersionSnapshot = isEnabled(Config.KEY_SPOOF_VERSION, false);
@@ -2476,11 +2609,17 @@ public final class HeyBoxModule extends XposedModule {
                 + " daily_share=" + dailyShareTaskSnapshot
                 + " splash=" + skipSplashAdSnapshot
                 + " global_ads=" + globalAdCleanSnapshot
+                + "[feed=" + adCleanFeedSnapshot
+                + ",home=" + adCleanHomeSnapshot
+                + ",banners=" + adCleanBannersSnapshot
+                + ",mall_bottom=" + adCleanMallBottomSnapshot + "]"
                 + " clipboard=" + disableClipboardTokenSnapshot
                 + " external_browser=" + externalBrowserSnapshot
                 + " media_autoplay=" + disableMediaAutoplaySnapshot
                 + " no_foreground_refresh=" + noForegroundRefreshSnapshot
                 + " image_enhance=" + imageEnhanceSnapshot
+                + " image_wifi=" + imageWifiAdaptiveSnapshot
+                + " post_text_select=" + postTextSelectSnapshot
                 + " suppress_update=" + suppressUpdatePromptSnapshot
                 + " spoof_version=" + spoofVersionSnapshot
                 + " mode=" + versionModeSnapshot
@@ -2891,7 +3030,21 @@ public final class HeyBoxModule extends XposedModule {
             enabled.add("隐藏发布按钮");
         }
         if (globalAdCleanSnapshot) {
-            enabled.add("全局广告净化");
+            List<String> adGroups = new ArrayList<>(4);
+            if (adCleanFeedSnapshot) {
+                adGroups.add("信息流");
+            }
+            if (adCleanHomeSnapshot) {
+                adGroups.add("首页/页内");
+            }
+            if (adCleanBannersSnapshot) {
+                adGroups.add("横幅");
+            }
+            if (adCleanMallBottomSnapshot) {
+                adGroups.add("商城底栏");
+            }
+            enabled.add("广告净化[" + (adGroups.isEmpty()
+                    ? "无子项" : String.join("/", adGroups)) + "]");
         }
         if (skipSplashAdSnapshot) {
             enabled.add("跳过开屏广告");
@@ -2915,7 +3068,11 @@ public final class HeyBoxModule extends XposedModule {
             enabled.add("禁止前台刷新");
         }
         if (imageEnhanceSnapshot) {
-            enabled.add("图片增强");
+            enabled.add(imageWifiAdaptiveSnapshot
+                    ? "图片增强[仅Wi-Fi]" : "图片增强");
+        }
+        if (postTextSelectSnapshot) {
+            enabled.add("帖子正文文字选择");
         }
         if (spoofVersionSnapshot) {
             enabled.add("版本伪装");
