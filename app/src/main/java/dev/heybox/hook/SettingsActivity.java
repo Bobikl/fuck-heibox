@@ -60,6 +60,7 @@ public final class SettingsActivity extends Activity {
     private LinearLayout customVersionRow;
     private EditText customVersionInput;
     private EditText customVersionCodeInput;
+    private volatile HttpURLConnection versionConnection;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -76,6 +77,16 @@ public final class SettingsActivity extends Activity {
         if (versionStatus != null) {
             refreshVersionArea();
         }
+    }
+
+    @Override
+    protected void onDestroy() {
+        HttpURLConnection connection = versionConnection;
+        versionConnection = null;
+        if (connection != null) {
+            connection.disconnect();
+        }
+        super.onDestroy();
     }
 
     private void configureWindow() {
@@ -100,8 +111,14 @@ public final class SettingsActivity extends Activity {
                 topInset = Math.max(topInset,
                         insets.getDisplayCutout().getSafeInsetTop());
             }
-            if (view.getPaddingTop() != topInset) {
-                view.setPadding(0, topInset, 0, 0);
+            int leftInset = insets.getSystemWindowInsetLeft();
+            int rightInset = insets.getSystemWindowInsetRight();
+            int bottomInset = insets.getSystemWindowInsetBottom();
+            if (view.getPaddingTop() != topInset
+                    || view.getPaddingLeft() != leftInset
+                    || view.getPaddingRight() != rightInset
+                    || view.getPaddingBottom() != bottomInset) {
+                view.setPadding(leftInset, topInset, rightInset, bottomInset);
             }
             return insets;
         });
@@ -123,30 +140,30 @@ public final class SettingsActivity extends Activity {
         LinearLayout cleanCard = createCard();
         cleanCard.addView(createSwitchRow(
                 "隐藏首页发布按钮", "移除底部导航栏中间的发布入口",
-                Config.KEY_HIDE_PUBLISH, true));
+                 Config.KEY_HIDE_PUBLISH, false));
         cleanCard.addView(createDivider());
         cleanCard.addView(createSwitchRow(
                 "自动完成分享任务", "点击“去完成”后直接上报分享成功",
-                Config.KEY_SHARE_TASK, true));
+                 Config.KEY_SHARE_TASK, false));
         cleanCard.addView(createDivider());
         cleanCard.addView(createSwitchRow(
                 "首次启动自动完成分享任务", "每天第一次启动并加载任务后自动执行一次",
-                Config.KEY_DAILY_SHARE_TASK, true));
+                 Config.KEY_DAILY_SHARE_TASK, false));
         cleanCard.addView(createDivider());
         cleanCard.addView(createSwitchRow(
                 "跳过开屏广告", "保留原启动流程，仅跳过广告素材",
-                Config.KEY_SKIP_SPLASH_AD, true));
+                 Config.KEY_SKIP_SPLASH_AD, false));
         content.addView(cleanCard, cardMargins());
 
         addSectionLabel("版本兼容");
         LinearLayout versionCard = createCard();
         versionCard.addView(createSwitchRow(
                 "伪装应用版本", "对小黑盒自身的版本读取返回目标版本",
-                Config.KEY_SPOOF_VERSION, true));
+                 Config.KEY_SPOOF_VERSION, false));
         versionCard.addView(createDivider());
         versionCard.addView(createSwitchRow(
                 "屏蔽版本更新弹窗", "检测到当前版本过旧时不显示升级提示",
-                Config.KEY_SUPPRESS_UPDATE_PROMPT, true));
+                 Config.KEY_SUPPRESS_UPDATE_PROMPT, false));
         versionCard.addView(createDivider());
         versionCard.addView(createVersionModeRow());
         versionCard.addView(createDivider());
@@ -234,6 +251,7 @@ public final class SettingsActivity extends Activity {
             HttpURLConnection connection = null;
             try {
                 connection = (HttpURLConnection) new URL(VERSION_SOURCE_URL).openConnection();
+                versionConnection = connection;
                 connection.setConnectTimeout(8000);
                 connection.setReadTimeout(8000);
                 connection.setInstanceFollowRedirects(true);
@@ -267,12 +285,18 @@ public final class SettingsActivity extends Activity {
                 if (connection != null) {
                     connection.disconnect();
                 }
+                if (versionConnection == connection) {
+                    versionConnection = null;
+                }
             }
 
             String latest = version;
             long latestCode = versionCode;
             String failure = error;
             runOnUiThread(() -> {
+                if (isFinishing() || isDestroyed()) {
+                    return;
+                }
                 button.setEnabled(true);
                 button.setText("获取小黑盒最新版本");
                 if (!isPlausibleVersion(latest) || !isPlausibleVersionCode(latestCode)) {
@@ -281,10 +305,11 @@ public final class SettingsActivity extends Activity {
                     return;
                 }
                 VersionIdentity installed = getInstalledTargetVersion();
-                if (isPlausibleVersion(installed.name)
-                        && compareVersions(latest, installed.name) < 0) {
+                if ((isPlausibleVersion(installed.name)
+                        && compareVersions(latest, installed.name) < 0)
+                        || (installed.code > 0L && latestCode < installed.code)) {
                     Toast.makeText(this,
-                            "数据源版本低于已安装版本，未写入",
+                            "数据源版本名称或编号低于已安装版本，未写入",
                             Toast.LENGTH_LONG).show();
                     return;
                 }
@@ -377,14 +402,12 @@ public final class SettingsActivity extends Activity {
         Switch toggle = new Switch(this);
         toggle.setChecked(preferences.getBoolean(key, defaultValue));
         toggle.setButtonTintList(null);
-        if (android.os.Build.VERSION.SDK_INT >= 21) {
-            toggle.setTrackTintList(new android.content.res.ColorStateList(
-                    new int[][]{new int[]{android.R.attr.state_checked}, new int[]{}},
-                    new int[]{withAlpha(COLOR_ACCENT, 120), Color.rgb(211, 213, 218)}));
-            toggle.setThumbTintList(new android.content.res.ColorStateList(
-                    new int[][]{new int[]{android.R.attr.state_checked}, new int[]{}},
-                    new int[]{COLOR_ACCENT, Color.WHITE}));
-        }
+        toggle.setTrackTintList(new android.content.res.ColorStateList(
+                new int[][]{new int[]{android.R.attr.state_checked}, new int[]{}},
+                new int[]{withAlpha(COLOR_ACCENT, 120), Color.rgb(211, 213, 218)}));
+        toggle.setThumbTintList(new android.content.res.ColorStateList(
+                new int[][]{new int[]{android.R.attr.state_checked}, new int[]{}},
+                new int[]{COLOR_ACCENT, Color.WHITE}));
         toggle.setOnCheckedChangeListener((button, checked) ->
                 preferences.edit().putBoolean(key, checked).apply());
         row.setOnClickListener(view -> toggle.setChecked(!toggle.isChecked()));

@@ -25,10 +25,9 @@ import java.lang.reflect.Modifier;
 import java.lang.reflect.Constructor;
 import java.lang.reflect.Proxy;
 import java.lang.ref.WeakReference;
-import java.text.SimpleDateFormat;
+import java.time.LocalDate;
 import java.util.ArrayList;
 import java.util.Collections;
-import java.util.Date;
 import java.util.IdentityHashMap;
 import java.util.List;
 import java.util.Locale;
@@ -43,7 +42,7 @@ import io.github.libxposed.api.XposedModule;
  */
 public final class HeyBoxModule extends XposedModule {
     private static final String TAG = "HeyBoxHook";
-    private static final String MODULE_VERSION = "0.5.7";
+    private static final String MODULE_VERSION = "0.5.8";
     private static final String TARGET_PACKAGE = Config.TARGET_PACKAGE;
     private static final String MAIN_ACTIVITY = "com.max.xiaoheihe.MainActivity";
     private static final String TASK_FRAGMENT =
@@ -73,10 +72,11 @@ public final class HeyBoxModule extends XposedModule {
     private static final int CURRENT_TASK_STATE_TEXT_ID = 0x7f0a0f6d;
     private static final int CURRENT_TASK_STATE_CONTAINER_ID = 0x7f0a14c0;
     private static final String DAILY_RUNTIME_PREFS = "heybox_hook_runtime";
-    private static final String DAILY_SHARE_DATE = "daily_share_date";
+    private static final String DAILY_SHARE_DATE_PREFIX = "daily_share_date:";
     private static final long DAILY_SHARE_START_DELAY_MS = 3500L;
     private static final long DAILY_SHARE_RETRY_DELAY_MS = 5000L;
     private static final int DAILY_SHARE_MAX_FETCH_ATTEMPTS = 2;
+    private static final long DAILY_SHARE_FETCH_TIMEOUT_MS = 20000L;
     private static final boolean VERBOSE_TASK_LOG = false;
 
     private static final String[] CENTER_VIEW_NAMES = {
@@ -89,11 +89,17 @@ public final class HeyBoxModule extends XposedModule {
     private SharedPreferences preferences;
     private volatile Context targetContext;
     private volatile WeakReference<Activity> lastTargetActivity = new WeakReference<>(null);
-    private volatile String latestServerVersion = "";
     private Method appUpdateCheckMethod;
     private Method checkVersionGetVersion;
+    private Method loginStateMethod;
+    private Method currentUserIdMethod;
     private volatile boolean forceLegacyVersionForCheck;
-    private volatile boolean spoofVersionSnapshot = true;
+    private volatile boolean hidePublishSnapshot;
+    private volatile boolean shareTaskSnapshot;
+    private volatile boolean dailyShareTaskSnapshot;
+    private volatile boolean skipSplashAdSnapshot;
+    private volatile boolean suppressUpdatePromptSnapshot;
+    private volatile boolean spoofVersionSnapshot;
     private volatile String versionModeSnapshot = Config.VERSION_MODE_AUTO;
     private volatile String customVersionSnapshot = "";
     private volatile long customVersionCodeSnapshot;
@@ -102,8 +108,11 @@ public final class HeyBoxModule extends XposedModule {
     /** 版本拦截热路径使用的基准值缓存（目标 APK 当前真实值为 1.3.347/916）。 */
     private volatile String effectiveVersionSnapshot = "1.3.347";
     private volatile long effectiveVersionCodeSnapshot = 916L;
+    private volatile boolean versionIdentityOverrideSnapshot;
     private volatile boolean dailyShareInProgress;
     private volatile boolean dailyShareFetchRequested;
+    private long dailyShareRequestGeneration;
+    private int dailyShareActiveAttempt;
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
     private final Map<Object, Runnable> pendingTaskRefreshes = new WeakHashMap<>();
     private final Map<Activity, List<WeakReference<View>>> centerNavigationViews =
@@ -148,15 +157,21 @@ public final class HeyBoxModule extends XposedModule {
         info("PKG_READY package=" + param.getPackageName()
                 + " loader=" + classLoader.getClass().getName());
 
-        loadVersionConfigSnapshot();
+        loadFeatureConfigSnapshot();
 
         installMainUiHooks(classLoader);
-        installTaskShareHook(classLoader);
-        installTaskButtonHook(classLoader);
-        installDailyTaskHook(classLoader);
+        if (shareTaskSnapshot) {
+            installTaskShareHook(classLoader);
+            installTaskButtonHook(classLoader);
+        }
+        if (shareTaskSnapshot && dailyShareTaskSnapshot) {
+            installDailyTaskHook(classLoader);
+        }
         installSettingsEntryHook(classLoader);
         installVersionSpoofHooks(classLoader);
-        installSplashAdHook(classLoader);
+        if (skipSplashAdSnapshot) {
+            installSplashAdHook(classLoader);
+        }
     }
 
     private void installMainUiHooks(ClassLoader classLoader) {
@@ -176,12 +191,12 @@ public final class HeyBoxModule extends XposedModule {
 
                 // 在原始初始化前关闭当前版本控制中心发布入口的静态开关。
                 // 即使字段被热修复忽略，方法执行后的 View 处理仍然会生效。
-                if (isEnabled(Config.KEY_HIDE_PUBLISH, true)) {
+                if (hidePublishSnapshot) {
                     disableCurrentCenterFlag(mainActivityClass);
                 }
 
                 Object result = chain.proceed();
-                if (isEnabled(Config.KEY_HIDE_PUBLISH, true)) {
+                if (hidePublishSnapshot) {
                     hideCenterNavigation(activity, "onCreate");
                 }
                 // Activity 完成初始化后再触发内部检查，避免更新管理器拿到未完成
@@ -193,7 +208,7 @@ public final class HeyBoxModule extends XposedModule {
             hook(onResume).intercept(chain -> {
                 Object result = chain.proceed();
                 lastTargetActivity = new WeakReference<>((Activity) chain.getThisObject());
-                if (isEnabled(Config.KEY_HIDE_PUBLISH, true)) {
+                if (hidePublishSnapshot) {
                     hideCenterNavigation((Activity) chain.getThisObject(), "onResume");
                 }
                 // onCreate 时应用的登录态和网络组件可能尚未准备好。等首页真正
@@ -266,7 +281,13 @@ public final class HeyBoxModule extends XposedModule {
                 boolean resolveViews = cachedViews == null
                         || cachedViews.size() != ids.length;
                 if (!resolveViews) {
-                    for (WeakReference<View> reference : cachedViews) {
+                    for (int index = 0; index < cachedViews.size(); index++) {
+                        // 资源不存在时缓存的是空引用；它不是失效缓存，不能因此在
+                        // 每次 onResume 都重新遍历整棵 View 树。
+                        if (ids[index] == 0) {
+                            continue;
+                        }
+                        WeakReference<View> reference = cachedViews.get(index);
                         View cached = reference == null ? null : reference.get();
                         if (cached == null || !cached.isAttachedToWindow()) {
                             resolveViews = true;
@@ -324,9 +345,6 @@ public final class HeyBoxModule extends XposedModule {
             getTitle.setAccessible(true);
 
             hook(shareEntry).intercept(chain -> {
-                if (!isEnabled(Config.KEY_SHARE_TASK, true)) {
-                    return chain.proceed();
-                }
                 Object shareData = chain.getArg(1);
                 Object listener = shareData == null ? null : getShareListener.invoke(shareData);
 
@@ -390,9 +408,6 @@ public final class HeyBoxModule extends XposedModule {
 
             hook(bind).intercept(chain -> {
                 Object result = chain.proceed();
-                if (!isEnabled(Config.KEY_SHARE_TASK, true)) {
-                    return result;
-                }
                 Object holder = chain.getArg(0);
                 Object task = chain.getArg(1);
                 if (holder == null || task == null) {
@@ -490,6 +505,20 @@ public final class HeyBoxModule extends XposedModule {
      */
     private void installDailyTaskHook(ClassLoader classLoader) {
         try {
+            try {
+                Class<?> accountUtils = Class.forName(
+                        "com.max.xiaoheihe.utils.i0", false, classLoader);
+                loginStateMethod = accountUtils.getDeclaredMethod("s");
+                currentUserIdMethod = accountUtils.getDeclaredMethod("j");
+                loginStateMethod.setAccessible(true);
+                currentUserIdMethod.setAccessible(true);
+            } catch (Throwable throwable) {
+                loginStateMethod = null;
+                currentUserIdMethod = null;
+                warn("DAILY_TASK_ACCOUNT_PREPARE_ERROR error="
+                        + unwrap(throwable).getClass().getSimpleName());
+            }
+
             Class<?> fragmentClass = Class.forName(TASK_FRAGMENT, false, classLoader);
             Class<?> resultClass = Class.forName(TASK_RESULT, false, classLoader);
             Method consume = fragmentClass.getDeclaredMethod(
@@ -497,10 +526,7 @@ public final class HeyBoxModule extends XposedModule {
             consume.setAccessible(true);
             hook(consume).intercept(chain -> {
                 Object result = chain.proceed();
-                if (isEnabled(Config.KEY_DAILY_SHARE_TASK, true)
-                        && isEnabled(Config.KEY_SHARE_TASK, true)) {
-                    scheduleDailyShareTasks(chain.getArg(0), chain.getArg(1), classLoader);
-                }
+                scheduleDailyShareTasks(chain.getArg(0), chain.getArg(1), classLoader);
                 return result;
             });
             info("HOOK_DAILY_TASK_OK method=" + TASK_FRAGMENT + ".n4");
@@ -514,37 +540,50 @@ public final class HeyBoxModule extends XposedModule {
      * 请求链复用原生 u4() 的 IO/Main 调度，失败时只做一次有限重试。
      */
     private void triggerDailyShareFetch(ClassLoader classLoader) {
-        if (!isEnabled(Config.KEY_DAILY_SHARE_TASK, true)
-                || !isEnabled(Config.KEY_SHARE_TASK, true)) {
+        if (!dailyShareTaskSnapshot || !shareTaskSnapshot) {
             return;
         }
         Context context = targetContext;
         if (context == null) {
             return;
         }
+        String accountKey = resolveDailyAccountKey();
+        if (accountKey.isEmpty()) {
+            return;
+        }
         String day = currentDay();
         if (day.equals(context.getSharedPreferences(
                 DAILY_RUNTIME_PREFS, Context.MODE_PRIVATE)
-                .getString(DAILY_SHARE_DATE, ""))) {
+                .getString(dailyShareDateKey(accountKey), ""))) {
             return;
         }
+        final long generation;
         synchronized (this) {
             if (dailyShareFetchRequested || dailyShareInProgress) {
                 return;
             }
             dailyShareFetchRequested = true;
+            dailyShareActiveAttempt = 1;
+            generation = ++dailyShareRequestGeneration;
         }
-        new Handler(Looper.getMainLooper()).postDelayed(
-                () -> requestDailyShareList(classLoader, day, 1),
+        mainHandler.postDelayed(
+                () -> requestDailyShareList(
+                        classLoader, day, accountKey, 1, generation),
                 DAILY_SHARE_START_DELAY_MS);
         info("DAILY_TASK_FETCH_SCHEDULED day=" + day
                 + " delay_ms=" + DAILY_SHARE_START_DELAY_MS);
     }
 
-    private void requestDailyShareList(ClassLoader classLoader, String day, int attempt) {
-        if (!dailyShareFetchRequested) {
+    private void requestDailyShareList(ClassLoader classLoader, String day,
+                                       String accountKey, int attempt, long generation) {
+        if (!isDailyShareRequestActive(generation, attempt)) {
             return;
         }
+        if (!day.equals(currentDay()) || !accountKey.equals(resolveDailyAccountKey())) {
+            invalidateDailyShareRequest();
+            return;
+        }
+        final boolean[] emitted = {false};
         try {
             Class<?> networkFactory = Class.forName(
                     "com.max.xiaoheihe.network.i", false, classLoader);
@@ -573,6 +612,10 @@ public final class HeyBoxModule extends XposedModule {
                     new Class<?>[]{observerClass}, (proxy, method, args) -> {
                         String name = method.getName();
                         if ("onNext".equals(name) && args != null && args.length > 0) {
+                            if (!isDailyShareRequestActive(generation, attempt)) {
+                                return null;
+                            }
+                            emitted[0] = true;
                             Object envelope = args[0];
                             Object value = envelope;
                             try {
@@ -585,11 +628,19 @@ public final class HeyBoxModule extends XposedModule {
                                 // 某些网络层直接回调 TaskResultObj。
                             }
                             Object taskResult = value;
-                            new Handler(Looper.getMainLooper()).post(() -> {
+                            mainHandler.post(() -> {
+                                if (!isDailyShareRequestActive(generation, attempt)) {
+                                    return;
+                                }
+                                if (!accountKey.equals(resolveDailyAccountKey())) {
+                                    invalidateDailyShareRequest();
+                                    return;
+                                }
                                 boolean handled = scheduleDailyShareTasks(
                                         null, taskResult, classLoader);
                                 if (!handled) {
-                                    scheduleDailyShareRetry(classLoader, day, attempt,
+                                    scheduleDailyShareRetry(classLoader, day, accountKey,
+                                            attempt, generation,
                                             "invalid_or_unhandled_result");
                                 }
                             });
@@ -597,39 +648,77 @@ public final class HeyBoxModule extends XposedModule {
                             Throwable fetchError = args != null && args.length > 0
                                     && args[0] instanceof Throwable
                                     ? (Throwable) args[0] : null;
-                            scheduleDailyShareRetry(classLoader, day, attempt,
+                            scheduleDailyShareRetry(classLoader, day, accountKey,
+                                    attempt, generation,
                                     fetchError == null ? "unknown" : fetchError.getMessage());
+                        } else if ("onComplete".equals(name) && !emitted[0]) {
+                            scheduleDailyShareRetry(classLoader, day, accountKey,
+                                    attempt, generation, "completed_without_result");
                         }
                         return null;
                     });
             Method subscribe = observable.getClass().getMethod(
                     "J5", observerClass);
             subscribe.invoke(observable, observer);
+            mainHandler.postDelayed(() -> {
+                if (!emitted[0] && isDailyShareRequestActive(generation, attempt)) {
+                    scheduleDailyShareRetry(classLoader, day, accountKey,
+                            attempt, generation, "timeout");
+                }
+            }, DAILY_SHARE_FETCH_TIMEOUT_MS);
             info("DAILY_TASK_FETCH_REQUEST_OK endpoint=/task/list_v2/ attempt=" + attempt);
         } catch (Throwable throwable) {
-            scheduleDailyShareRetry(classLoader, day, attempt,
+            scheduleDailyShareRetry(classLoader, day, accountKey,
+                    attempt, generation,
                     unwrap(throwable).getClass().getSimpleName());
             error("DAILY_TASK_FETCH_REQUEST_ERROR attempt=" + attempt, unwrap(throwable));
         }
     }
 
     private void scheduleDailyShareRetry(ClassLoader classLoader, String day,
-                                          int attempt, String reason) {
-        warn("DAILY_TASK_FETCH_ERROR attempt=" + attempt + " reason=" + reason);
-        if (attempt >= DAILY_SHARE_MAX_FETCH_ATTEMPTS) {
-            dailyShareFetchRequested = false;
-            warn("DAILY_TASK_FETCH_GIVE_UP day=" + day);
-            return;
+                                          String accountKey, int attempt,
+                                          long generation, String reason) {
+        synchronized (this) {
+            if (!dailyShareFetchRequested
+                    || dailyShareRequestGeneration != generation
+                    || dailyShareActiveAttempt != attempt) {
+                return;
+            }
+            if (attempt >= DAILY_SHARE_MAX_FETCH_ATTEMPTS) {
+                dailyShareFetchRequested = false;
+                dailyShareActiveAttempt = 0;
+                dailyShareRequestGeneration++;
+                warn("DAILY_TASK_FETCH_GIVE_UP day=" + day);
+                return;
+            }
+            dailyShareActiveAttempt = attempt + 1;
         }
-        new Handler(Looper.getMainLooper()).postDelayed(
-                () -> requestDailyShareList(classLoader, day, attempt + 1),
+        warn("DAILY_TASK_FETCH_ERROR attempt=" + attempt + " reason=" + reason);
+        mainHandler.postDelayed(
+                () -> requestDailyShareList(classLoader, day, accountKey,
+                        attempt + 1, generation),
                 DAILY_SHARE_RETRY_DELAY_MS);
+    }
+
+    private synchronized boolean isDailyShareRequestActive(long generation, int attempt) {
+        return dailyShareFetchRequested
+                && dailyShareRequestGeneration == generation
+                && dailyShareActiveAttempt == attempt;
+    }
+
+    private synchronized void invalidateDailyShareRequest() {
+        dailyShareFetchRequested = false;
+        dailyShareActiveAttempt = 0;
+        dailyShareRequestGeneration++;
     }
 
     private boolean scheduleDailyShareTasks(Object fragment, Object taskResult,
                                             ClassLoader classLoader) {
-        if (taskResult == null || dailyShareInProgress) {
+        if (taskResult == null) {
             return false;
+        }
+        if (dailyShareInProgress) {
+            return true;
         }
 
         try {
@@ -640,10 +729,15 @@ public final class HeyBoxModule extends XposedModule {
             }
 
             String day = currentDay();
+            String accountKey = resolveDailyAccountKey();
+            if (accountKey.isEmpty()) {
+                warn("DAILY_TASK_SKIP reason=not_logged_in");
+                return false;
+            }
             List<Object> tasks = collectShareTasks(taskResult);
             if (tasks.isEmpty()) {
-                markDailyShareDay(context, day);
-                dailyShareFetchRequested = false;
+                markDailyShareDay(context, day, accountKey);
+                invalidateDailyShareRequest();
                 info("DAILY_TASK_SKIP reason=no_pending_share_task");
                 return true;
             }
@@ -652,12 +746,12 @@ public final class HeyBoxModule extends XposedModule {
 
             synchronized (this) {
                 if (dailyShareInProgress) {
-                    return false;
+                    return true;
                 }
                 SharedPreferences runtime = context.getSharedPreferences(
                         DAILY_RUNTIME_PREFS, Context.MODE_PRIVATE);
-                if (day.equals(runtime.getString(DAILY_SHARE_DATE, ""))) {
-                    dailyShareFetchRequested = false;
+                if (day.equals(runtime.getString(dailyShareDateKey(accountKey), ""))) {
+                    invalidateDailyShareRequest();
                     info("DAILY_TASK_SKIP reason=already_run day=" + day);
                     return true;
                 }
@@ -667,16 +761,16 @@ public final class HeyBoxModule extends XposedModule {
             }
 
             info("DAILY_TASK_START day=" + day + " count=" + tasks.size());
-            Handler handler = new Handler(Looper.getMainLooper());
-            DailyShareSummary summary = new DailyShareSummary(tasks.size(), day);
+            DailyShareSummary summary = new DailyShareSummary(
+                    tasks.size(), day, accountKey);
             for (int index = 0; index < tasks.size(); index++) {
                 final Object task = tasks.get(index);
                 final int taskIndex = index;
-                handler.postDelayed(() -> performDailyShareTask(
+                mainHandler.postDelayed(() -> performDailyShareTask(
                         fragment, task, taskIndex, summary, classLoader, context),
                         index * 450L);
             }
-            handler.postDelayed(() -> finishDailyShareTasks(
+            mainHandler.postDelayed(() -> finishDailyShareTasks(
                     fragment, summary, context), tasks.size() * 450L + 350L);
             return true;
         } catch (Throwable throwable) {
@@ -686,16 +780,37 @@ public final class HeyBoxModule extends XposedModule {
         }
     }
 
-    private void markDailyShareDay(Context context, String day) {
-        if (context == null || day == null || day.isEmpty()) {
+    private void markDailyShareDay(Context context, String day, String accountKey) {
+        if (context == null || day == null || day.isEmpty()
+                || accountKey == null || accountKey.isEmpty()) {
             return;
         }
         context.getSharedPreferences(DAILY_RUNTIME_PREFS, Context.MODE_PRIVATE)
-                .edit().putString(DAILY_SHARE_DATE, day).apply();
+                .edit().putString(dailyShareDateKey(accountKey), day).apply();
+    }
+
+    private static String dailyShareDateKey(String accountKey) {
+        return DAILY_SHARE_DATE_PREFIX + accountKey;
+    }
+
+    private String resolveDailyAccountKey() {
+        Method login = loginStateMethod;
+        Method userId = currentUserIdMethod;
+        if (login == null || userId == null) {
+            return "";
+        }
+        try {
+            if (!Boolean.TRUE.equals(login.invoke(null))) {
+                return "";
+            }
+            return stringValue(userId.invoke(null)).trim();
+        } catch (Throwable ignored) {
+            return "";
+        }
     }
 
     private static String currentDay() {
-        return new SimpleDateFormat("yyyy-MM-dd", Locale.ROOT).format(new Date());
+        return LocalDate.now().toString();
     }
 
     private Context getFragmentContext(Object fragment) {
@@ -847,6 +962,9 @@ public final class HeyBoxModule extends XposedModule {
                                        Context context) {
         String title = "";
         try {
+            if (!summary.accountKey.equals(resolveDailyAccountKey())) {
+                throw new IllegalStateException("account changed");
+            }
             Class<?> fragmentClass = Class.forName(TASK_FRAGMENT, false, classLoader);
             Class<?> taskClass = Class.forName(TASK_INFO, false, classLoader);
             Method reportTaskClick = fragmentClass.getMethod("N3", fragmentClass, taskClass);
@@ -901,11 +1019,11 @@ public final class HeyBoxModule extends XposedModule {
         dailyShareInProgress = false;
         boolean allCompleted = completed >= summary.scheduled;
         if (allCompleted && completed > 0) {
-            markDailyShareDay(context, summary.day);
+            markDailyShareDay(context, summary.day, summary.accountKey);
         }
         // 请求已经结束，允许下一次启动在部分任务失败时重试；完整成功或空列表
         // 会由日期标记阻止同一天重复请求。
-        dailyShareFetchRequested = false;
+        invalidateDailyShareRequest();
         if (completed <= 0) {
             warn("DAILY_TASK_FINISH completed=0");
             return;
@@ -1048,13 +1166,15 @@ public final class HeyBoxModule extends XposedModule {
     private static final class DailyShareSummary {
         final int scheduled;
         final String day;
+        final String accountKey;
         int completed;
         long exp;
         long coin;
 
-        DailyShareSummary(int scheduled, String day) {
+        DailyShareSummary(int scheduled, String day, String accountKey) {
             this.scheduled = scheduled;
             this.day = day;
+            this.accountKey = accountKey;
         }
     }
 
@@ -1070,12 +1190,32 @@ public final class HeyBoxModule extends XposedModule {
             Class<?> splashClass = Class.forName(SPLASH_ACTIVITY, false, classLoader);
             Method selectAd = selectorClass.getDeclaredMethod("g", boolean.class);
             Method splashInitialize = findInheritedMethod(splashClass, "k1");
-            Method adsDestroy = findInheritedMethod(splashClass, "onDestroy");
             Method continueLaunch = splashClass.getMethod("Y1", boolean.class);
+            Field adBindingField = splashClass.getSuperclass().getDeclaredField("O");
+            Class<?> adBindingClass = Class.forName("df.e", false, classLoader);
+            Constructor<?> emptyBindingConstructor = null;
+            for (Constructor<?> constructor : adBindingClass.getDeclaredConstructors()) {
+                boolean referencesOnly = true;
+                for (Class<?> parameter : constructor.getParameterTypes()) {
+                    if (parameter.isPrimitive()) {
+                        referencesOnly = false;
+                        break;
+                    }
+                }
+                if (referencesOnly && constructor.getParameterCount() == 12) {
+                    emptyBindingConstructor = constructor;
+                    break;
+                }
+            }
+            if (emptyBindingConstructor == null) {
+                throw new NoSuchMethodException("df.e reference-only constructor");
+            }
             selectAd.setAccessible(true);
             splashInitialize.setAccessible(true);
-            adsDestroy.setAccessible(true);
             continueLaunch.setAccessible(true);
+            adBindingField.setAccessible(true);
+            emptyBindingConstructor.setAccessible(true);
+            final Constructor<?> bindingConstructor = emptyBindingConstructor;
 
             // 比“让广告选择器返回 null”更快：不再创建和绑定广告页面，直接进入
             // SplashActivity 原本的无广告启动分支。隐私协议、登录态和初始化逻辑仍保留。
@@ -1086,55 +1226,38 @@ public final class HeyBoxModule extends XposedModule {
                         && splash.getIntent().getData() != null
                         && Config.URI_REQUEST_VERSION_CHECK.equals(
                         splash.getIntent().getData().toString())) {
+                    lastTargetActivity = new WeakReference<>(splash);
                     // 用完整初始化路径处理一次内部版本检测请求，完成后仍由广告
                     // 选择器 Hook 保证不会显示开屏广告。
                     Object result = chain.proceed();
                     handleVersionCheckRequest(splash);
                     return result;
                 }
-                if (!isEnabled(Config.KEY_SKIP_SPLASH_AD, true)) {
+                try {
+                    // AdsActivity.onDestroy() 只读取 O.j。提前写入全空轻量 binding，
+                    // 避免为了销毁流程在主线程 inflate 整套广告布局。
+                    if (adBindingField.get(splash) == null) {
+                        adBindingField.set(splash, bindingConstructor.newInstance(
+                                new Object[bindingConstructor.getParameterCount()]));
+                    }
+                    continueLaunch.invoke(splash, false);
+                    info("SPLASH_FAST_BYPASS");
+                    return null;
+                } catch (Throwable throwable) {
+                    // 目标结构变化时回退原初始化；广告选择器仍会返回 null，保证稳定。
+                    warn("SPLASH_FAST_BYPASS_FALLBACK error="
+                            + unwrap(throwable).getClass().getSimpleName());
                     return chain.proceed();
                 }
-                continueLaunch.invoke(splash, false);
-                info("SPLASH_FAST_BYPASS");
-                return null;
-            });
-
-            // 快速路径没有创建 AdsActivity 的 ViewBinding；其原 onDestroy() 未做空值
-            // 判断，会读取 O.j。此时只执行 Activity 自身的销毁即可，避免 NPE。
-            hook(adsDestroy).intercept(chain -> {
-                if (isEnabled(Config.KEY_SKIP_SPLASH_AD, true)
-                        && SPLASH_ACTIVITY.equals(chain.getThisObject().getClass().getName())) {
-                    Field binding = chain.getThisObject().getClass().getSuperclass()
-                            .getDeclaredField("O");
-                    binding.setAccessible(true);
-                    if (binding.get(chain.getThisObject()) == null) {
-                        // 先补一个轻量 ViewBinding，再让原 onDestroy 正常调用
-                        // BaseActivity.onDestroy()；这样既不会读空 O.j，也满足系统的
-                        // mCalled 检查。
-                        Class<?> bindingClass = Class.forName(
-                                "df.e", false, chain.getThisObject().getClass().getClassLoader());
-                        Method inflate = bindingClass.getMethod(
-                                "c", android.view.LayoutInflater.class);
-                        Object value = inflate.invoke(null,
-                                ((Activity) chain.getThisObject()).getLayoutInflater());
-                        binding.set(chain.getThisObject(), value);
-                        info("SPLASH_FAST_DESTROY_BINDING_READY");
-                    }
-                }
-                return chain.proceed();
             });
 
             hook(selectAd).intercept(chain -> {
-                if (!isEnabled(Config.KEY_SKIP_SPLASH_AD, true)) {
-                    return chain.proceed();
-                }
                 info("SPLASH_AD_BYPASS launch=" + chain.getArg(0));
                 return null;
             });
 
             info("HOOK_SPLASH_AD_OK methods=" + SPLASH_ACTIVITY
-                    + ".k1,AdsActivity.onDestroy," + OPEN_SCREEN_AD_SELECTOR + ".g");
+                    + ".k1," + OPEN_SCREEN_AD_SELECTOR + ".g");
         } catch (Throwable throwable) {
             error("HOOK_SPLASH_AD_ERROR method=" + OPEN_SCREEN_AD_SELECTOR + ".g", throwable);
         }
@@ -1218,7 +1341,7 @@ public final class HeyBoxModule extends XposedModule {
         entry.setContentDescription("进入小黑盒净化设置");
         setTitle.invoke(entry, "小黑盒净化");
         setTitleDesc.invoke(entry, "");
-        setRightDesc.invoke(entry, "5 项功能");
+        setRightDesc.invoke(entry, "点击管理");
         setRightType.invoke(entry, arrow);
         entry.setOnClickListener(view -> openModuleSettings(activity));
 
@@ -1267,19 +1390,22 @@ public final class HeyBoxModule extends XposedModule {
         return Enum.valueOf((Class<? extends Enum>) enumClass.asSubclass(Enum.class), name);
     }
 
-    /**
-     * 自动模式从官方 version_control_info 响应中学习最新 versionName；伪装入口覆盖
-     * 应用自己的 x0() 版本工具和 PackageManager 读取，避免改动系统中其他应用的信息。
-     */
+    /** 伪装应用自身的版本读取和请求参数，不改动系统中其他应用的信息。 */
     private void installVersionSpoofHooks(ClassLoader classLoader) {
         prepareVersionCheck(classLoader);
         installVersionResponseObserver(classLoader);
-        installUpdatePromptHooks(classLoader);
-        installAppVersionUtilityHook(classLoader);
-        installAppVersionCodeUtilityHook(classLoader);
+        if (suppressUpdatePromptSnapshot) {
+            installUpdatePromptHooks(classLoader);
+        }
+        // 诊断按钮需要在一次请求窗口内覆写 version/build，因此网络入口保留
+        // 一个布尔快速分支；其余版本 Hook 在功能关闭时完全不安装。
         installNetworkVersionIdentityHook(classLoader);
-        installBuildConfigVersionHooks(classLoader);
-        installPackageInfoHooks(classLoader);
+        if (spoofVersionSnapshot) {
+            installAppVersionUtilityHook(classLoader);
+            installAppVersionCodeUtilityHook(classLoader);
+            installBuildConfigVersionHooks(classLoader);
+            installPackageInfoHooks(classLoader);
+        }
     }
 
     private void prepareVersionCheck(ClassLoader classLoader) {
@@ -1303,9 +1429,11 @@ public final class HeyBoxModule extends XposedModule {
         }
         // 清掉 data，避免 Activity 复用或配置变化时重复发起请求。
         activity.getIntent().setData(null);
+        lastTargetActivity = new WeakReference<>(activity);
         Method check = appUpdateCheckMethod;
         if (check == null) {
             warn("VERSION_CHECK_REQUEST_SKIP method_missing");
+            showVersionCheckToast("版本检测失败：当前小黑盒版本不支持内部检测");
             return;
         }
         try {
@@ -1322,7 +1450,7 @@ public final class HeyBoxModule extends XposedModule {
             check.invoke(null, requestContext);
             info("VERSION_CHECK_REQUEST_OK context="
                     + requestContext.getClass().getSimpleName());
-            new Handler(Looper.getMainLooper()).postDelayed(() -> {
+            mainHandler.postDelayed(() -> {
                 if (forceLegacyVersionForCheck) {
                     forceLegacyVersionForCheck = false;
                     warn("VERSION_CHECK_REQUEST_TIMEOUT");
@@ -1342,34 +1470,16 @@ public final class HeyBoxModule extends XposedModule {
                     CHECK_VERSION_OBJECT, false, classLoader);
             Method getVersion = versionObject.getMethod("getVersion");
             checkVersionGetVersion = getVersion;
-            hook(getVersion).intercept(chain -> {
-                Object result = chain.proceed();
-                rememberLatestVersion(stringValue(result));
-                return result;
-            });
 
-            try {
-                Method setVersion = versionObject.getMethod("setVersion", String.class);
-                hook(setVersion).intercept(chain -> {
-                    rememberLatestVersion(stringValue(chain.getArg(0)));
-                    return chain.proceed();
+            if (suppressUpdatePromptSnapshot) {
+                Method getNeedUpdate = versionObject.getMethod("getNeed_update");
+                hook(getNeedUpdate).intercept(chain -> {
+                    Object result = chain.proceed();
+                    // 主动诊断请求期间保留服务端 need_update 原值，否则改成 0。
+                    return !forceLegacyVersionForCheck ? "0" : result;
                 });
-            } catch (NoSuchMethodException ignored) {
-                // Gson 直接写字段时，getVersion 观察器仍能获取返回值。
             }
 
-            Method getNeedUpdate = versionObject.getMethod("getNeed_update");
-            hook(getNeedUpdate).intercept(chain -> {
-                Object result = chain.proceed();
-                // 主动诊断请求期间保留服务端 need_update 原值，否则始终改成 0
-                // 会让测试看起来像“请求成功但没有任何更新结果”。
-                return isEnabled(Config.KEY_SPOOF_VERSION, true)
-                        && isEnabled(Config.KEY_SUPPRESS_UPDATE_PROMPT, true)
-                        && !forceLegacyVersionForCheck ? "0" : result;
-            });
-
-            // 更新回调在 need_update=0 时不会主动调用 getVersion()，因此在它判断更新
-            // 状态前读取一次响应对象，保证“检查更新”总能刷新自动模式缓存。
             Class<?> resultClass = Class.forName(
                     "com.max.hbutils.bean.Result", false, classLoader);
             Class<?> callbackClass = Class.forName(
@@ -1378,40 +1488,31 @@ public final class HeyBoxModule extends XposedModule {
             Method getResult = resultClass.getMethod("getResult");
             hook(callback).intercept(chain -> {
                 boolean diagnosticRequest = forceLegacyVersionForCheck;
+                if (!diagnosticRequest) {
+                    return chain.proceed();
+                }
                 String responseVersion = "";
                 boolean responseObjectFound = false;
                 try {
                     Object envelope = chain.getArg(0);
                     Object value = envelope == null ? null : getResult.invoke(envelope);
-                    info("VERSION_RESPONSE_CALLBACK envelope="
-                            + (envelope == null ? "null" : envelope.getClass().getSimpleName())
-                            + " value="
-                            + (value == null ? "null" : value.getClass().getSimpleName()));
                     if (versionObject.isInstance(value)) {
                         responseObjectFound = true;
                         responseVersion = readRawServerVersion(value);
                         info("VERSION_RESPONSE_DATA version=" + responseVersion);
-                        rememberLatestVersion(responseVersion);
                     }
                 } catch (Throwable throwable) {
                     warn("VERSION_RESPONSE_READ_ERROR "
                             + unwrap(throwable).getClass().getSimpleName());
                 }
-                if (diagnosticRequest) {
-                    forceLegacyVersionForCheck = false;
-                    if (responseObjectFound && isPlausibleVersion(responseVersion)) {
-                        showVersionCheckToast("版本检测成功：服务器版本 " + responseVersion);
-                    } else {
-                        showVersionCheckToast("版本检测成功，但服务器未返回版本号");
-                    }
-                    // 诊断按钮只报告结果，不继续走小黑盒原生升级弹窗。
-                    return null;
+                forceLegacyVersionForCheck = false;
+                if (responseObjectFound && isPlausibleVersion(responseVersion)) {
+                    showVersionCheckToast("版本检测成功：服务器版本 " + responseVersion);
+                } else {
+                    showVersionCheckToast("版本检测成功，但服务器未返回版本号");
                 }
-                Object callbackResult = chain.proceed();
-                if (forceLegacyVersionForCheck) {
-                    forceLegacyVersionForCheck = false;
-                }
-                return callbackResult;
+                // 诊断按钮只报告结果，不继续走小黑盒原生升级弹窗。
+                return null;
             });
 
             Class<?> networkCallback = Class.forName(
@@ -1433,7 +1534,7 @@ public final class HeyBoxModule extends XposedModule {
                         showVersionCheckToast("版本检测失败：" + errorMessage(error));
                         return null;
                     }
-                    if (isEnabled(Config.KEY_SUPPRESS_UPDATE_PROMPT, true)) {
+                    if (suppressUpdatePromptSnapshot) {
                         // 普通版本请求失败时，基础 Observer 也可能创建“请升级”
                         // 错误弹窗；独立开关开启时一并吞掉该 UI 错误链。
                         info("VERSION_RESPONSE_ERROR_SUPPRESSED");
@@ -1471,9 +1572,6 @@ public final class HeyBoxModule extends XposedModule {
             Method showForcedUpdate = updateManager.getMethod(
                     "v", appCompatActivity, versionObject);
             hook(showForcedUpdate).intercept(chain -> {
-                if (!isEnabled(Config.KEY_SUPPRESS_UPDATE_PROMPT, true)) {
-                    return chain.proceed();
-                }
                 info("UPDATE_PROMPT_SUPPRESSED method=AppUpdateManager.v");
                 return null;
             });
@@ -1481,9 +1579,6 @@ public final class HeyBoxModule extends XposedModule {
             Method showUpdate = updateManager.getMethod(
                     "w", appCompatActivity, versionObject, Boolean.class);
             hook(showUpdate).intercept(chain -> {
-                if (!isEnabled(Config.KEY_SUPPRESS_UPDATE_PROMPT, true)) {
-                    return chain.proceed();
-                }
                 info("UPDATE_PROMPT_SUPPRESSED method=AppUpdateManager.w");
                 return null;
             });
@@ -1491,9 +1586,6 @@ public final class HeyBoxModule extends XposedModule {
             Method showBeta = updateManager.getMethod(
                     "B", appCompatActivity, betaTestInfo);
             hook(showBeta).intercept(chain -> {
-                if (!isEnabled(Config.KEY_SUPPRESS_UPDATE_PROMPT, true)) {
-                    return chain.proceed();
-                }
                 info("UPDATE_PROMPT_SUPPRESSED method=AppUpdateManager.B");
                 return null;
             });
@@ -1502,9 +1594,6 @@ public final class HeyBoxModule extends XposedModule {
                 Method showReady = updateManager.getDeclaredMethod("C");
                 showReady.setAccessible(true);
                 hook(showReady).intercept(chain -> {
-                    if (!isEnabled(Config.KEY_SUPPRESS_UPDATE_PROMPT, true)) {
-                        return chain.proceed();
-                    }
                     info("UPDATE_PROMPT_SUPPRESSED method=AppUpdateManager.C");
                     return null;
                 });
@@ -1598,24 +1687,25 @@ public final class HeyBoxModule extends XposedModule {
             configure.setAccessible(true);
             hook(configure).intercept(chain -> {
                 Object result = chain.proceed();
-                if (spoofVersionSnapshot) {
-                    Object builder = chain.getArg(0);
-                    String endpoint = stringValue(chain.getArg(1));
-                    // 诊断请求只对版本控制接口使用低版本身份；不能把 0.0.0
-                    // 写入所有并发请求，否则统计/首页请求会被服务端判定为过旧，
-                    // 继而在 RxCachedThreadScheduler 上弹升级对话框并导致闪退。
-                    boolean diagnosticVersionRequest = forceLegacyVersionForCheck
-                            && isVersionCheckEndpoint(endpoint);
-                    String version = diagnosticVersionRequest
-                            ? "0.0.0" : resolveSpoofVersion("1.3.347");
-                    long versionCode = diagnosticVersionRequest
-                            ? 1L : resolveSpoofVersionCode(916L);
-                    queryMethod.invoke(builder, "version", version);
-                    queryMethod.invoke(builder, "build", String.valueOf(versionCode));
-                    if (diagnosticVersionRequest) {
-                        info("VERSION_CHECK_IDENTITY endpoint=" + endpoint
-                                + " version=" + version + " build=" + versionCode);
-                    }
+                String endpoint = forceLegacyVersionForCheck
+                        ? stringValue(chain.getArg(1)) : "";
+                // 诊断不依赖“伪装版本”总开关；否则默认关闭全部功能后诊断按钮失效。
+                boolean diagnosticVersionRequest = forceLegacyVersionForCheck
+                        && isVersionCheckEndpoint(endpoint);
+                if (!diagnosticVersionRequest && !versionIdentityOverrideSnapshot) {
+                    return result;
+                }
+
+                Object builder = chain.getArg(0);
+                String version = diagnosticVersionRequest
+                        ? "0.0.0" : effectiveVersionSnapshot;
+                long versionCode = diagnosticVersionRequest
+                        ? 1L : effectiveVersionCodeSnapshot;
+                queryMethod.invoke(builder, "version", version);
+                queryMethod.invoke(builder, "build", String.valueOf(versionCode));
+                if (diagnosticVersionRequest) {
+                    info("VERSION_CHECK_IDENTITY endpoint=" + endpoint
+                            + " version=" + version + " build=" + versionCode);
                 }
                 return result;
             });
@@ -1676,41 +1766,29 @@ public final class HeyBoxModule extends XposedModule {
                         || method.getReturnType() != PackageInfo.class) {
                     continue;
                 }
-                method.setAccessible(true);
-                hook(method).intercept(chain -> {
-                    Object result = chain.proceed();
-                    if (!spoofVersionSnapshot
-                            || !TARGET_PACKAGE.equals(chain.getArg(0))
-                            || !(result instanceof PackageInfo)) {
-                        return result;
-                    }
-                    if (result instanceof PackageInfo) {
+                try {
+                    method.setAccessible(true);
+                    hook(method).intercept(chain -> {
+                        Object result = chain.proceed();
+                        if (!versionIdentityOverrideSnapshot
+                                || !TARGET_PACKAGE.equals(chain.getArg(0))
+                                || !(result instanceof PackageInfo)) {
+                            return result;
+                        }
                         PackageInfo packageInfo = (PackageInfo) result;
-                        packageInfo.versionName = resolveSpoofVersion(packageInfo.versionName);
-                        long realVersionCode = getPackageVersionCode(packageInfo);
-                        setPackageVersionCode(packageInfo,
-                                resolveSpoofVersionCode(realVersionCode));
-                    }
-                    return result;
-                });
-                installed++;
+                        applySpoofPackageIdentity(packageInfo);
+                        return result;
+                    });
+                    installed++;
+                } catch (Throwable throwable) {
+                    warn("HOOK_PACKAGE_INFO_OVERLOAD_SKIP method=" + method
+                            + " reason=" + throwable.getClass().getSimpleName());
+                }
             }
             info("HOOK_PACKAGE_INFO_OK overloads=" + installed);
         } catch (Throwable throwable) {
             error("HOOK_PACKAGE_INFO_ERROR", throwable);
         }
-    }
-
-    private void rememberLatestVersion(String version) {
-        String value = version == null ? "" : version.trim();
-        if (!isPlausibleVersion(value) || value.equals(latestServerVersion)) {
-            return;
-        }
-        latestServerVersion = value;
-        info("VERSION_LATEST_DETECTED version=" + value);
-        // version_control_info 只返回 versionName，没有对应的 versionCode；不把
-        // 它写入持久缓存，避免自动模式复用旧编号造成成对标识错配。设置页的
-        // 小米商店接口会同时写入两个字段，作为自动伪装的可靠来源。
     }
 
     private static boolean isVersionCheckEndpoint(String endpoint) {
@@ -1724,14 +1802,15 @@ public final class HeyBoxModule extends XposedModule {
 
     private void showVersionCheckToast(String message) {
         Activity activity = lastTargetActivity.get();
-        if (activity == null) {
+        Context context = activity == null ? targetContext : activity;
+        if (context == null) {
             return;
         }
-        new Handler(Looper.getMainLooper()).post(() -> {
+        mainHandler.post(() -> {
             try {
-                if (!activity.isFinishing()
-                        && (Build.VERSION.SDK_INT < 17 || !activity.isDestroyed())) {
-                    Toast.makeText(activity, message, Toast.LENGTH_LONG).show();
+                if (activity == null
+                        || (!activity.isFinishing() && !activity.isDestroyed())) {
+                    Toast.makeText(context, message, Toast.LENGTH_LONG).show();
                 }
             } catch (Throwable throwable) {
                 warn("VERSION_CHECK_TOAST_ERROR "
@@ -1781,7 +1860,8 @@ public final class HeyBoxModule extends XposedModule {
         String mode = versionModeSnapshot;
         if (Config.VERSION_MODE_CUSTOM.equals(mode)) {
             String custom = customVersionSnapshot;
-            return isPlausibleVersion(custom) ? custom : real;
+            return isPlausibleVersion(custom)
+                    && isPlausibleVersionCode(customVersionCodeSnapshot) ? custom : real;
         }
 
         // 仅使用应用商店接口保存的成对数据，避免把更新接口返回的 versionName
@@ -1789,6 +1869,7 @@ public final class HeyBoxModule extends XposedModule {
         String latest = cachedLatestVersionSnapshot;
         if (!isPlausibleVersion(latest)
                 || !isPlausibleVersionCode(cachedLatestVersionCodeSnapshot)
+                || cachedLatestVersionCodeSnapshot < 916L
                 || compareVersions(latest, real) < 0) {
             return real;
         }
@@ -1804,12 +1885,15 @@ public final class HeyBoxModule extends XposedModule {
             return effectiveVersionCodeSnapshot;
         }
         if (Config.VERSION_MODE_CUSTOM.equals(versionModeSnapshot)) {
-            return isPlausibleVersionCode(customVersionCodeSnapshot)
+            return isPlausibleVersion(customVersionSnapshot)
+                    && isPlausibleVersionCode(customVersionCodeSnapshot)
                     ? customVersionCodeSnapshot : realVersionCode;
         }
         long latestCode = cachedLatestVersionCodeSnapshot;
         // versionCode 单调递增；更新应用后不使用更低的旧缓存。
-        return isPlausibleVersionCode(latestCode) && latestCode >= realVersionCode
+        return isPlausibleVersion(cachedLatestVersionSnapshot)
+                && compareVersions(cachedLatestVersionSnapshot, "1.3.347") >= 0
+                && isPlausibleVersionCode(latestCode) && latestCode >= realVersionCode
                 ? latestCode : realVersionCode;
     }
 
@@ -1820,28 +1904,52 @@ public final class HeyBoxModule extends XposedModule {
         if (!spoofVersionSnapshot) {
             effectiveVersionSnapshot = effectiveName;
             effectiveVersionCodeSnapshot = effectiveCode;
+            versionIdentityOverrideSnapshot = false;
             return;
         }
         if (Config.VERSION_MODE_CUSTOM.equals(versionModeSnapshot)) {
-            if (isPlausibleVersion(customVersionSnapshot)) {
+            if (isPlausibleVersion(customVersionSnapshot)
+                    && isPlausibleVersionCode(customVersionCodeSnapshot)) {
                 effectiveName = customVersionSnapshot;
-            }
-            if (isPlausibleVersionCode(customVersionCodeSnapshot)) {
                 effectiveCode = customVersionCodeSnapshot;
             }
         } else {
             if (isPlausibleVersion(cachedLatestVersionSnapshot)
                     && isPlausibleVersionCode(cachedLatestVersionCodeSnapshot)
-                    && compareVersions(cachedLatestVersionSnapshot, "1.3.347") >= 0) {
-                effectiveName = cachedLatestVersionSnapshot;
-            }
-            if (isPlausibleVersionCode(cachedLatestVersionCodeSnapshot)
+                    && compareVersions(cachedLatestVersionSnapshot, "1.3.347") >= 0
                     && cachedLatestVersionCodeSnapshot >= 916L) {
+                effectiveName = cachedLatestVersionSnapshot;
                 effectiveCode = cachedLatestVersionCodeSnapshot;
             }
         }
         effectiveVersionSnapshot = effectiveName;
         effectiveVersionCodeSnapshot = effectiveCode;
+        versionIdentityOverrideSnapshot = !"1.3.347".equals(effectiveName)
+                || effectiveCode != 916L;
+    }
+
+    private void applySpoofPackageIdentity(PackageInfo packageInfo) {
+        String realName = packageInfo.versionName == null ? "" : packageInfo.versionName;
+        long realCode = getPackageVersionCode(packageInfo);
+        String resolvedName = realName;
+        long resolvedCode = realCode;
+        if (Config.VERSION_MODE_CUSTOM.equals(versionModeSnapshot)) {
+            if (isPlausibleVersion(customVersionSnapshot)
+                    && isPlausibleVersionCode(customVersionCodeSnapshot)) {
+                resolvedName = customVersionSnapshot;
+                resolvedCode = customVersionCodeSnapshot;
+            }
+        } else if (isPlausibleVersion(cachedLatestVersionSnapshot)
+                && isPlausibleVersionCode(cachedLatestVersionCodeSnapshot)
+                && compareVersions(cachedLatestVersionSnapshot, realName) >= 0
+                && cachedLatestVersionCodeSnapshot >= realCode) {
+            resolvedName = cachedLatestVersionSnapshot;
+            resolvedCode = cachedLatestVersionCodeSnapshot;
+        }
+        if (!resolvedName.equals(realName) || resolvedCode != realCode) {
+            packageInfo.versionName = resolvedName;
+            setPackageVersionCode(packageInfo, resolvedCode);
+        }
     }
 
     @SuppressWarnings("deprecation")
@@ -1868,8 +1976,14 @@ public final class HeyBoxModule extends XposedModule {
      * 版本号读取位于请求拦截器热路径中。配置只承诺重启目标应用后完全生效，
      * 因此进程启动时读取一次，避免每个网络请求都跨进程访问 RemotePreferences。
      */
-    private void loadVersionConfigSnapshot() {
-        spoofVersionSnapshot = isEnabled(Config.KEY_SPOOF_VERSION, true);
+    private void loadFeatureConfigSnapshot() {
+        hidePublishSnapshot = isEnabled(Config.KEY_HIDE_PUBLISH, false);
+        shareTaskSnapshot = isEnabled(Config.KEY_SHARE_TASK, false);
+        dailyShareTaskSnapshot = isEnabled(Config.KEY_DAILY_SHARE_TASK, false);
+        skipSplashAdSnapshot = isEnabled(Config.KEY_SKIP_SPLASH_AD, false);
+        suppressUpdatePromptSnapshot = isEnabled(
+                Config.KEY_SUPPRESS_UPDATE_PROMPT, false);
+        spoofVersionSnapshot = isEnabled(Config.KEY_SPOOF_VERSION, false);
         versionModeSnapshot = getPreferenceString(
                 Config.KEY_VERSION_MODE, Config.VERSION_MODE_AUTO);
         customVersionSnapshot = getPreferenceString(Config.KEY_CUSTOM_VERSION, "").trim();
@@ -1879,7 +1993,12 @@ public final class HeyBoxModule extends XposedModule {
         cachedLatestVersionCodeSnapshot = getPreferenceLong(
                 Config.KEY_LATEST_VERSION_CODE, 0L);
         refreshEffectiveVersionSnapshot();
-        info("VERSION_CONFIG_READY enabled=" + spoofVersionSnapshot
+        info("FEATURE_CONFIG_READY hide_publish=" + hidePublishSnapshot
+                + " share=" + shareTaskSnapshot
+                + " daily_share=" + dailyShareTaskSnapshot
+                + " splash=" + skipSplashAdSnapshot
+                + " suppress_update=" + suppressUpdatePromptSnapshot
+                + " spoof_version=" + spoofVersionSnapshot
                 + " mode=" + versionModeSnapshot
                 + " cached=" + cachedLatestVersionSnapshot
                 + "(" + cachedLatestVersionCodeSnapshot + ")");

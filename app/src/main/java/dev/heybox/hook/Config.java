@@ -23,16 +23,8 @@ public final class Config {
     public static final String VERSION_MODE_AUTO = "auto";
     public static final String VERSION_MODE_CUSTOM = "custom";
 
-    public static final String ACTION_CACHE_LATEST_VERSION =
-            MODULE_PACKAGE + ".CACHE_LATEST_VERSION";
-    public static final String ACTION_REQUEST_VERSION_CHECK =
-            MODULE_PACKAGE + ".REQUEST_VERSION_CHECK";
     public static final String URI_REQUEST_VERSION_CHECK =
             "xiaoheihe://heyboxhook/version-check";
-    public static final String EXTRA_LATEST_VERSION = "latest_version";
-    public static final String EXTRA_LATEST_VERSION_CODE = "latest_version_code";
-    public static final String URI_OPEN_SETTINGS =
-            "xiaoheihe://heyboxhook/settings";
 
     private Config() {
     }
