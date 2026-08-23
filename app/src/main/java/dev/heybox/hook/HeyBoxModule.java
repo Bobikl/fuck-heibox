@@ -1,12 +1,17 @@
 package dev.heybox.hook;
 
+import android.annotation.SuppressLint;
 import android.app.Activity;
+import android.content.BroadcastReceiver;
 import android.content.ComponentName;
 import android.content.Context;
 import android.content.Intent;
+import android.content.IntentFilter;
 import android.content.SharedPreferences;
 import android.content.res.Resources;
 import android.content.pm.PackageInfo;
+import android.content.pm.ResolveInfo;
+import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
@@ -29,6 +34,7 @@ import java.time.LocalDate;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.IdentityHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Set;
@@ -42,7 +48,7 @@ import io.github.libxposed.api.XposedModule;
  */
 public final class HeyBoxModule extends XposedModule {
     private static final String TAG = "HeyBoxHook";
-    private static final String MODULE_VERSION = "0.5.8";
+    private static final String MODULE_VERSION = Config.MODULE_VERSION;
     private static final String TARGET_PACKAGE = Config.TARGET_PACKAGE;
     private static final String MAIN_ACTIVITY = "com.max.xiaoheihe.MainActivity";
     private static final String TASK_FRAGMENT =
@@ -98,6 +104,12 @@ public final class HeyBoxModule extends XposedModule {
     private volatile boolean shareTaskSnapshot;
     private volatile boolean dailyShareTaskSnapshot;
     private volatile boolean skipSplashAdSnapshot;
+    private volatile boolean globalAdCleanSnapshot;
+    private volatile boolean disableClipboardTokenSnapshot;
+    private volatile boolean externalBrowserSnapshot;
+    private volatile boolean disableMediaAutoplaySnapshot;
+    private volatile boolean noForegroundRefreshSnapshot;
+    private volatile boolean imageEnhanceSnapshot;
     private volatile boolean suppressUpdatePromptSnapshot;
     private volatile boolean spoofVersionSnapshot;
     private volatile String versionModeSnapshot = Config.VERSION_MODE_AUTO;
@@ -117,9 +129,14 @@ public final class HeyBoxModule extends XposedModule {
     private final Map<Object, Runnable> pendingTaskRefreshes = new WeakHashMap<>();
     private final Map<Activity, List<WeakReference<View>>> centerNavigationViews =
             new WeakHashMap<>();
+    private final Set<Object> requestedOriginalImages =
+            Collections.newSetFromMap(new WeakHashMap<>());
     private volatile Resources centerNavigationResources;
     private volatile int[] centerNavigationIds;
     private String currentProcessName = "";
+    private final Set<String> installedHookGroups = new LinkedHashSet<>();
+    private BroadcastReceiver selfCheckReceiver;
+    private volatile boolean selfCheckReceiverRegistered;
 
     @Override
     public void onModuleLoaded(ModuleLoadedParam param) {
@@ -159,7 +176,11 @@ public final class HeyBoxModule extends XposedModule {
 
         loadFeatureConfigSnapshot();
 
-        installMainUiHooks(classLoader);
+        if (hidePublishSnapshot
+                || (shareTaskSnapshot && dailyShareTaskSnapshot)
+                || spoofVersionSnapshot) {
+            installMainUiHooks(classLoader);
+        }
         if (shareTaskSnapshot) {
             installTaskShareHook(classLoader);
             installTaskButtonHook(classLoader);
@@ -168,9 +189,29 @@ public final class HeyBoxModule extends XposedModule {
             installDailyTaskHook(classLoader);
         }
         installSettingsEntryHook(classLoader);
-        installVersionSpoofHooks(classLoader);
+        if (spoofVersionSnapshot || suppressUpdatePromptSnapshot) {
+            installVersionSpoofHooks(classLoader);
+        }
         if (skipSplashAdSnapshot) {
             installSplashAdHook(classLoader);
+        }
+        if (globalAdCleanSnapshot) {
+            installGlobalAdHooks(classLoader);
+        }
+        if (disableClipboardTokenSnapshot) {
+            installClipboardTokenHook(classLoader);
+        }
+        if (externalBrowserSnapshot) {
+            installExternalBrowserHooks(classLoader);
+        }
+        if (disableMediaAutoplaySnapshot) {
+            installMediaAutoplayHooks(classLoader);
+        }
+        if (noForegroundRefreshSnapshot) {
+            installForegroundRefreshHook(classLoader);
+        }
+        if (imageEnhanceSnapshot) {
+            installImageEnhancementHook(classLoader);
         }
     }
 
@@ -178,11 +219,7 @@ public final class HeyBoxModule extends XposedModule {
         try {
             Class<?> mainActivityClass = Class.forName(MAIN_ACTIVITY, false, classLoader);
             Method onCreate = mainActivityClass.getDeclaredMethod("onCreate", Bundle.class);
-            Method onResume = mainActivityClass.getDeclaredMethod("onResume");
-            Method onNewIntent = mainActivityClass.getDeclaredMethod("onNewIntent", Intent.class);
             onCreate.setAccessible(true);
-            onResume.setAccessible(true);
-            onNewIntent.setAccessible(true);
 
             hook(onCreate).intercept(chain -> {
                 Activity activity = (Activity) chain.getThisObject();
@@ -201,32 +238,50 @@ public final class HeyBoxModule extends XposedModule {
                 }
                 // Activity 完成初始化后再触发内部检查，避免更新管理器拿到未完成
                 // 初始化的上下文；SplashActivity 深链路径仍由其自身 Hook 处理。
-                handleVersionCheckRequest(activity);
-                return result;
-            });
-
-            hook(onResume).intercept(chain -> {
-                Object result = chain.proceed();
-                lastTargetActivity = new WeakReference<>((Activity) chain.getThisObject());
-                if (hidePublishSnapshot) {
-                    hideCenterNavigation((Activity) chain.getThisObject(), "onResume");
+                if (spoofVersionSnapshot) {
+                    handleVersionCheckRequest(activity);
                 }
-                // onCreate 时应用的登录态和网络组件可能尚未准备好。等首页真正
-                // resume 后再请求任务列表，避免只有进入“我的任务”页面才触发 n4。
-                triggerDailyShareFetch(classLoader);
                 return result;
             });
 
-            hook(onNewIntent).intercept(chain -> {
-                Object result = chain.proceed();
-                Activity activity = (Activity) chain.getThisObject();
-                lastTargetActivity = new WeakReference<>(activity);
-                handleVersionCheckRequest(activity);
-                return result;
-            });
+            boolean needsResumeHook = hidePublishSnapshot
+                    || (shareTaskSnapshot && dailyShareTaskSnapshot);
+            if (needsResumeHook) {
+                Method onResume = mainActivityClass.getDeclaredMethod("onResume");
+                onResume.setAccessible(true);
+                hook(onResume).intercept(chain -> {
+                    Object result = chain.proceed();
+                    lastTargetActivity = new WeakReference<>((Activity) chain.getThisObject());
+                    if (hidePublishSnapshot) {
+                        hideCenterNavigation((Activity) chain.getThisObject(), "onResume");
+                    }
+                    // onCreate 时应用的登录态和网络组件可能尚未准备好。等首页真正
+                    // resume 后再请求任务列表，避免只有进入“我的任务”页面才触发 n4。
+                    triggerDailyShareFetch(classLoader);
+                    return result;
+                });
+            }
 
+            if (spoofVersionSnapshot) {
+                Method onNewIntent = mainActivityClass.getDeclaredMethod(
+                        "onNewIntent", Intent.class);
+                onNewIntent.setAccessible(true);
+                hook(onNewIntent).intercept(chain -> {
+                    Object result = chain.proceed();
+                    Activity activity = (Activity) chain.getThisObject();
+                    lastTargetActivity = new WeakReference<>(activity);
+                    handleVersionCheckRequest(activity);
+                    return result;
+                });
+            }
+
+            recordHookGroup("基础/自检");
+            if (hidePublishSnapshot) {
+                recordHookGroup("隐藏发布按钮");
+            }
             info("HOOK_UI_OK class=" + MAIN_ACTIVITY
-                    + " methods=onCreate,onResume,onNewIntent");
+                    + " resume=" + needsResumeHook
+                    + " new_intent=" + spoofVersionSnapshot);
         } catch (Throwable throwable) {
             error("HOOK_UI_ERROR class=" + MAIN_ACTIVITY, throwable);
         }
@@ -373,6 +428,7 @@ public final class HeyBoxModule extends XposedModule {
                 }
             });
 
+            recordHookGroup("分享任务入口");
             info("HOOK_SHARE_OK method=" + SHARE_UTIL + ".E(Context,HBShareData)");
         } catch (Throwable throwable) {
             error("HOOK_SHARE_ERROR method=" + SHARE_UTIL + ".E", throwable);
@@ -492,6 +548,7 @@ public final class HeyBoxModule extends XposedModule {
                 return result;
             });
 
+            recordHookGroup("分享任务按钮");
             info("HOOK_TASK_BUTTON_OK method=" + TASK_ADAPTER + ".o(holder,task)");
         } catch (Throwable throwable) {
             error("HOOK_TASK_BUTTON_ERROR method=" + TASK_ADAPTER + ".o", throwable);
@@ -529,6 +586,7 @@ public final class HeyBoxModule extends XposedModule {
                 scheduleDailyShareTasks(chain.getArg(0), chain.getArg(1), classLoader);
                 return result;
             });
+            recordHookGroup("每日分享任务");
             info("HOOK_DAILY_TASK_OK method=" + TASK_FRAGMENT + ".n4");
         } catch (Throwable throwable) {
             error("HOOK_DAILY_TASK_ERROR method=" + TASK_FRAGMENT + ".n4", throwable);
@@ -1256,10 +1314,413 @@ public final class HeyBoxModule extends XposedModule {
                 return null;
             });
 
+            recordHookGroup("开屏广告");
             info("HOOK_SPLASH_AD_OK methods=" + SPLASH_ACTIVITY
                     + ".k1," + OPEN_SCREEN_AD_SELECTOR + ".g");
         } catch (Throwable throwable) {
             error("HOOK_SPLASH_AD_ERROR method=" + OPEN_SCREEN_AD_SELECTOR + ".g", throwable);
+        }
+    }
+
+    /**
+     * 广告净化只拦截广告模型的低频 getter 和明确的展示入口，不扫描 View 树，
+     * 也不在 RecyclerView 绑定热路径按资源名反复查找。
+     */
+    private void installGlobalAdHooks(ClassLoader classLoader) {
+        int installed = 0;
+        try {
+            Class<?> mainActivity = Class.forName(MAIN_ACTIVITY, false, classLoader);
+            Class<?> innerAd = Class.forName(
+                    "com.max.xiaoheihe.bean.InnerAdsInfoObj", false, classLoader);
+            Method loadInnerAds = mainActivity.getDeclaredMethod("K2");
+            Method showInnerAd = mainActivity.getDeclaredMethod("V3", innerAd);
+            Method showBubbleAd = mainActivity.getDeclaredMethod("S2");
+            loadInnerAds.setAccessible(true);
+            showInnerAd.setAccessible(true);
+            showBubbleAd.setAccessible(true);
+            hook(loadInnerAds).intercept(chain -> null);
+            hook(showInnerAd).intercept(chain -> null);
+            hook(showBubbleAd).intercept(chain -> null);
+            installed += 3;
+        } catch (Throwable throwable) {
+            warn("AD_MAIN_HOOK_SKIP reason="
+                    + unwrap(throwable).getClass().getSimpleName());
+        }
+
+        installed += hookConstantNoArgGetter(classLoader,
+                "com.max.xiaoheihe.bean.AdsInfosObj", "getInner_ads",
+                Collections.emptyList());
+        installed += hookConstantNoArgGetter(classLoader,
+                "com.max.xiaoheihe.bean.ads.OverallAdInfo", "getBubble_ad", null);
+        installed += hookConstantNoArgGetter(classLoader,
+                "com.max.xiaoheihe.bean.ads.OverallAdInfo", "getHome_corner_ad", null);
+        installed += hookConstantNoArgGetter(classLoader,
+                "com.max.xiaoheihe.bean.bbs.FeedsContentAdObj", "getBanners",
+                Collections.emptyList());
+        String[][] bannerGetters = {
+                {"com.max.xiaoheihe.bean.bbs.BBSTopicLinksObj", "getBanner"},
+                {"com.max.xiaoheihe.bean.bbs.BbsRecommendObj", "getBanner"},
+                {"com.max.xiaoheihe.bean.bbs.BBSTopicBannerResult", "getAds_banner"},
+                {"com.max.xiaoheihe.bean.bbs.HashtagLinkListResultObj", "getAds_banner"},
+                {"com.max.xiaoheihe.bean.account.SignInResultObj", "getAds_banner"},
+                {"com.max.xiaoheihe.bean.game.gameoverview.GameOverviewBannerObj", "getAd_list"},
+                {"com.max.xiaoheihe.bean.trade.TradeSteamInventoryResult", "getBanner"},
+                {"com.max.xiaoheihe.bean.mall.MallHeaderObj", "getBanners"},
+                {"com.max.xiaoheihe.bean.mall.MallProductObj", "getBanners"}
+        };
+        for (String[] target : bannerGetters) {
+            installed += hookConstantNoArgGetter(
+                    classLoader, target[0], target[1], Collections.emptyList());
+        }
+
+        try {
+            Class<?> manager = Class.forName(
+                    "com.max.xiaoheihe.module.mall.BottomBarManager", false, classLoader);
+            Class<?> protocol = Class.forName(
+                    "com.max.xiaoheihe.bean.WebProtocolObj", false, classLoader);
+            Class<?> notificationType = Class.forName(
+                    "com.max.xiaoheihe.module.mall.NotificationType",
+                    false, classLoader);
+            Method showBottomAd = manager.getDeclaredMethod("c", View.class,
+                    protocol, Context.class, int.class, notificationType);
+            showBottomAd.setAccessible(true);
+            hook(showBottomAd).intercept(chain -> null);
+            installed++;
+        } catch (Throwable throwable) {
+            warn("AD_MALL_HOOK_SKIP reason="
+                    + unwrap(throwable).getClass().getSimpleName());
+        }
+
+        try {
+            Class<?> feedsAd = Class.forName(
+                    "com.max.xiaoheihe.bean.bbs.FeedsContentAdObj", false, classLoader);
+            String[][] feedGetters = {
+                    {"com.max.xiaoheihe.bean.news.LinkListResultObj", "getLinks"},
+                    {"com.max.xiaoheihe.bean.bbs.BBSTopicLinksObj", "getLinks"},
+                    {"com.max.xiaoheihe.bean.bbs.HashtagLinkListResultObj", "getLinks"},
+                    {"com.max.xiaoheihe.bean.bbs.BBSFollowedMomentsObj", "getMoments"},
+                    {"com.max.xiaoheihe.bean.bbs.ProfileEventResult", "getMoments"},
+                    {"com.max.xiaoheihe.bean.news.SubjectDetailResultOjb", "getNews_list"},
+                    {"com.max.xiaoheihe.bean.news.ConceptFeedsResult", "getLinks"},
+                    {"com.max.xiaoheihe.bean.bbs.BbsRecommendObj", "getLinks"},
+                    {"com.max.xiaoheihe.bean.bbs.CollectionFolder", "getLinks"},
+                    {"com.max.xiaoheihe.bean.bbs.RecallFeedsResult", "getVisible_links"},
+                    {"com.max.xiaoheihe.bean.bbs.RecallFeedsResult", "getUnexposed_links"}
+            };
+            for (String[] target : feedGetters) {
+                try {
+                    Class<?> owner = Class.forName(target[0], false, classLoader);
+                    Method getter = owner.getMethod(target[1]);
+                    hook(getter).intercept(chain ->
+                            filterFeedAds(chain.proceed(), feedsAd));
+                    installed++;
+                } catch (Throwable throwable) {
+                    warn("AD_FEED_GETTER_SKIP method=" + target[0] + "." + target[1]
+                            + " reason=" + unwrap(throwable).getClass().getSimpleName());
+                }
+            }
+        } catch (Throwable throwable) {
+            warn("AD_FEED_CLASS_SKIP reason="
+                    + unwrap(throwable).getClass().getSimpleName());
+        }
+
+        if (installed > 0) {
+            recordHookGroup("全局广告净化");
+            info("HOOK_GLOBAL_AD_OK methods=" + installed);
+        } else {
+            warn("HOOK_GLOBAL_AD_EMPTY");
+        }
+    }
+
+    private int hookConstantNoArgGetter(ClassLoader classLoader, String className,
+                                         String methodName, Object value) {
+        try {
+            Class<?> owner = Class.forName(className, false, classLoader);
+            Method getter = owner.getMethod(methodName);
+            hook(getter).intercept(chain -> value);
+            return 1;
+        } catch (Throwable throwable) {
+            warn("AD_GETTER_SKIP method=" + className + "." + methodName
+                    + " reason=" + unwrap(throwable).getClass().getSimpleName());
+            return 0;
+        }
+    }
+
+    private static Object filterFeedAds(Object value, Class<?> feedsAdClass) {
+        if (!(value instanceof List<?>)) {
+            return value;
+        }
+        List<?> source = (List<?>) value;
+        boolean containsAd = false;
+        for (Object item : source) {
+            if (item != null && feedsAdClass.isInstance(item)) {
+                containsAd = true;
+                break;
+            }
+        }
+        if (!containsAd) {
+            return value;
+        }
+        ArrayList<Object> filtered = new ArrayList<>(source.size());
+        for (Object item : source) {
+            if (item == null || !feedsAdClass.isInstance(item)) {
+                filtered.add(item);
+            }
+        }
+        return filtered;
+    }
+
+    private void installClipboardTokenHook(ClassLoader classLoader) {
+        try {
+            Class<?> manager = Class.forName(
+                    "com.max.xiaoheihe.module.copyedtoken.CopyedTokenManager",
+                    false, classLoader);
+            Method checkClipboard = manager.getDeclaredMethod(
+                    "c", Activity.class, boolean.class);
+            checkClipboard.setAccessible(true);
+            hook(checkClipboard).intercept(chain -> null);
+            recordHookGroup("剪贴板保护");
+            info("HOOK_CLIPBOARD_TOKEN_OK method=CopyedTokenManager.c");
+        } catch (Throwable throwable) {
+            error("HOOK_CLIPBOARD_TOKEN_ERROR", throwable);
+        }
+    }
+
+    private void installExternalBrowserHooks(ClassLoader classLoader) {
+        try {
+            Class<?> router = Class.forName(
+                    "com.max.xiaoheihe.base.router.b", false, classLoader);
+            Class<?> webCallback = Class.forName(
+                    "com.max.xiaoheihe.module.webview.t", false, classLoader);
+            Method open = router.getMethod("j0", Context.class, String.class);
+            Method openTemplate = router.getMethod("k0", Context.class, String.class);
+            Method openFromWeb = router.getMethod("l0", Context.class, String.class,
+                    android.webkit.WebView.class, String.class, webCallback);
+            Method[] methods = {open, openTemplate, openFromWeb};
+            for (Method method : methods) {
+                hook(method).intercept(chain -> {
+                    Context context = (Context) chain.getArg(0);
+                    String url = (String) chain.getArg(1);
+                    return openExternalUrl(context, url) ? null : chain.proceed();
+                });
+            }
+            recordHookGroup("外部浏览器");
+            info("HOOK_EXTERNAL_BROWSER_OK methods=j0,k0,l0");
+        } catch (Throwable throwable) {
+            error("HOOK_EXTERNAL_BROWSER_ERROR", throwable);
+        }
+    }
+
+    private boolean openExternalUrl(Context context, String url) {
+        if (context == null || url == null) {
+            return false;
+        }
+        Uri uri;
+        try {
+            uri = Uri.parse(url);
+        } catch (Throwable ignored) {
+            return false;
+        }
+        String scheme = uri.getScheme();
+        if (scheme == null || !("http".equalsIgnoreCase(scheme)
+                || "https".equalsIgnoreCase(scheme))) {
+            return false;
+        }
+        try {
+            Intent intent = new Intent(Intent.ACTION_VIEW, uri);
+            intent.addCategory(Intent.CATEGORY_BROWSABLE);
+            ResolveInfo resolved = context.getPackageManager().resolveActivity(
+                    intent, android.content.pm.PackageManager.MATCH_DEFAULT_ONLY);
+            String packageName = resolved == null || resolved.activityInfo == null
+                    ? "" : resolved.activityInfo.packageName;
+            if (packageName.isEmpty() || TARGET_PACKAGE.equals(packageName)) {
+                List<ResolveInfo> candidates = context.getPackageManager()
+                        .queryIntentActivities(intent,
+                                android.content.pm.PackageManager.MATCH_DEFAULT_ONLY);
+                packageName = "";
+                for (ResolveInfo candidate : candidates) {
+                    String candidatePackage = candidate.activityInfo == null
+                            ? "" : candidate.activityInfo.packageName;
+                    if (!candidatePackage.isEmpty()
+                            && !TARGET_PACKAGE.equals(candidatePackage)
+                            && !Config.MODULE_PACKAGE.equals(candidatePackage)) {
+                        packageName = candidatePackage;
+                        break;
+                    }
+                }
+            }
+            if (packageName.isEmpty() || TARGET_PACKAGE.equals(packageName)) {
+                return false;
+            }
+            intent.setPackage(packageName);
+            if (!(context instanceof Activity)) {
+                intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+            }
+            context.startActivity(intent);
+            return true;
+        } catch (Throwable throwable) {
+            warn("EXTERNAL_BROWSER_FALLBACK reason="
+                    + throwable.getClass().getSimpleName());
+            return false;
+        }
+    }
+
+    private void installMediaAutoplayHooks(ClassLoader classLoader) {
+        int installed = 0;
+        try {
+            Class<?> videoView = Class.forName(
+                    "com.max.xiaoheihe.module.game.component.GameVideoCardView",
+                    false, classLoader);
+            Class<?> videoData = Class.forName(
+                    "com.max.xiaoheihe.bean.game.recommend.GameCardVideoObj",
+                    false, classLoader);
+            Method play = videoView.getDeclaredMethod("l", videoData, boolean.class);
+            play.setAccessible(true);
+            hook(play).intercept(chain -> Boolean.FALSE.equals(chain.getArg(1))
+                    ? null : chain.proceed());
+            installed++;
+        } catch (Throwable throwable) {
+            warn("MEDIA_VIDEO_HOOK_SKIP reason="
+                    + unwrap(throwable).getClass().getSimpleName());
+        }
+
+        try {
+            Class<?> imageLoader = Class.forName("com.max.hbimage.b", false, classLoader);
+            Class<?> requestBuilder = Class.forName(
+                    "com.bumptech.glide.i", false, classLoader);
+            Class<?> requestOptions = Class.forName(
+                    "com.bumptech.glide.request.h", false, classLoader);
+            Method disableAnimation = requestOptions.getMethod("r");
+            Constructor<?> requestOptionsConstructor = requestOptions.getConstructor();
+            Method load = imageLoader.getDeclaredMethod("J", requestBuilder,
+                    requestOptions, String.class, android.widget.ImageView.class);
+            disableAnimation.setAccessible(true);
+            load.setAccessible(true);
+            hook(load).intercept(chain -> {
+                if (!isGifResource(stringValue(chain.getArg(2)))) {
+                    return chain.proceed();
+                }
+                Object options = chain.getArg(1);
+                if (options == null) {
+                    options = requestOptionsConstructor.newInstance();
+                }
+                Object disabledOptions = disableAnimation.invoke(options);
+                Object[] arguments = chain.getArgs().toArray();
+                arguments[1] = disabledOptions;
+                return chain.proceed(arguments);
+            });
+            installed++;
+        } catch (Throwable throwable) {
+            warn("MEDIA_GIF_HOOK_SKIP reason="
+                    + unwrap(throwable).getClass().getSimpleName());
+        }
+
+        try {
+            Class<?> imageViewerBuilder = Class.forName(
+                    "com.max.xiaoheihe.utils.imageviewer.ImageViewerHelper$a",
+                    false, classLoader);
+            Method disableViewerGif = imageViewerBuilder.getMethod("a");
+            Method startViewer = imageViewerBuilder.getMethod("p");
+            hook(startViewer).intercept(chain -> {
+                disableViewerGif.invoke(chain.getThisObject());
+                return chain.proceed();
+            });
+            installed++;
+        } catch (Throwable throwable) {
+            warn("MEDIA_VIEWER_GIF_HOOK_SKIP reason="
+                    + unwrap(throwable).getClass().getSimpleName());
+        }
+
+        if (installed > 0) {
+            recordHookGroup("媒体防自动播放");
+            info("HOOK_MEDIA_AUTOPLAY_OK methods=" + installed);
+        } else {
+            warn("HOOK_MEDIA_AUTOPLAY_EMPTY");
+        }
+    }
+
+    private static boolean isGifResource(String value) {
+        return containsIgnoreCase(value, ".gif")
+                || containsIgnoreCase(value, "format=gif")
+                || containsIgnoreCase(value, "image/gif");
+    }
+
+    private static boolean containsIgnoreCase(String value, String token) {
+        int limit = value.length() - token.length();
+        for (int index = 0; index <= limit; index++) {
+            if (value.regionMatches(true, index, token, 0, token.length())) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private void installForegroundRefreshHook(ClassLoader classLoader) {
+        try {
+            Class<?> mainActivity = Class.forName(MAIN_ACTIVITY, false, classLoader);
+            Class<?> signInManager = Class.forName(
+                    "com.max.xiaoheihe.module.signin.SignInManager",
+                    false, classLoader);
+            Method foreground = mainActivity.getMethod("R3");
+            Field backgroundAt = mainActivity.getDeclaredField("M");
+            Method getSignInManager = signInManager.getMethod("f");
+            Method syncSignIn = signInManager.getMethod("c");
+            backgroundAt.setAccessible(true);
+            hook(foreground).intercept(chain -> {
+                try {
+                    if (backgroundAt.getLong(chain.getThisObject()) > 0L) {
+                        Object manager = getSignInManager.invoke(null);
+                        if (manager != null) {
+                            syncSignIn.invoke(manager);
+                        }
+                    }
+                    return null;
+                } catch (Throwable throwable) {
+                    warn("FOREGROUND_REFRESH_FALLBACK reason="
+                            + unwrap(throwable).getClass().getSimpleName());
+                    return chain.proceed();
+                }
+            });
+            recordHookGroup("阻止前台刷新");
+            info("HOOK_FOREGROUND_REFRESH_OK method=MainActivity.R3");
+        } catch (Throwable throwable) {
+            error("HOOK_FOREGROUND_REFRESH_ERROR", throwable);
+        }
+    }
+
+    /** 只在全屏图片查看器内自动点击一次“查看原图”，不改变信息流缩略图请求。 */
+    private void installImageEnhancementHook(ClassLoader classLoader) {
+        try {
+            Class<?> customizer = Class.forName(
+                    "com.max.xiaoheihe.utils.imageviewer.ui.BaseResUICustomizer",
+                    false, classLoader);
+            Class<?> mediaData = Class.forName(
+                    "com.max.xiaoheihe.utils.imageviewer.MediaData", false, classLoader);
+            Method updateOriginal = customizer.getMethod(
+                    "K", mediaData, TextView.class);
+            Method isOriginal = mediaData.getMethod("j");
+            Method getOriginalUrl = mediaData.getMethod("g");
+            hook(updateOriginal).intercept(chain -> {
+                Object result = chain.proceed();
+                Object data = chain.getArg(0);
+                TextView originalButton = (TextView) chain.getArg(1);
+                if (data != null && originalButton != null
+                        && Boolean.FALSE.equals(isOriginal.invoke(data))
+                        && !stringValue(getOriginalUrl.invoke(data)).isEmpty()
+                        && originalButton.hasOnClickListeners()) {
+                    synchronized (requestedOriginalImages) {
+                        if (!requestedOriginalImages.add(data)) {
+                            return result;
+                        }
+                    }
+                    originalButton.performClick();
+                }
+                return result;
+            });
+            recordHookGroup("图片增强");
+            info("HOOK_IMAGE_ENHANCE_OK method=BaseResUICustomizer.K");
+        } catch (Throwable throwable) {
+            error("HOOK_IMAGE_ENHANCE_ERROR", throwable);
         }
     }
 
@@ -1298,6 +1759,7 @@ public final class HeyBoxModule extends XposedModule {
                 Activity activity = (Activity) chain.getThisObject();
                 targetContext = activity.getApplicationContext();
                 lastTargetActivity = new WeakReference<>(activity);
+                ensureSelfCheckReceiver(targetContext);
                 handleVersionCheckRequest(activity);
                 try {
                     addSettingsEntry(activity, itemConstructor, setTitle, setTitleDesc,
@@ -1307,6 +1769,7 @@ public final class HeyBoxModule extends XposedModule {
                 }
                 return result;
             });
+            recordHookGroup("设置入口");
             info("HOOK_SETTINGS_OK method=" + TARGET_SETTINGS_ACTIVITY + ".k1");
         } catch (Throwable throwable) {
             error("HOOK_SETTINGS_ERROR class=" + TARGET_SETTINGS_ACTIVITY, throwable);
@@ -1392,15 +1855,17 @@ public final class HeyBoxModule extends XposedModule {
 
     /** 伪装应用自身的版本读取和请求参数，不改动系统中其他应用的信息。 */
     private void installVersionSpoofHooks(ClassLoader classLoader) {
-        prepareVersionCheck(classLoader);
+        if (spoofVersionSnapshot) {
+            prepareVersionCheck(classLoader);
+        }
         installVersionResponseObserver(classLoader);
         if (suppressUpdatePromptSnapshot) {
             installUpdatePromptHooks(classLoader);
         }
-        // 诊断按钮需要在一次请求窗口内覆写 version/build，因此网络入口保留
-        // 一个布尔快速分支；其余版本 Hook 在功能关闭时完全不安装。
-        installNetworkVersionIdentityHook(classLoader);
         if (spoofVersionSnapshot) {
+            // 主动诊断需要在一次请求窗口内覆写 version/build。只有伪装功能开启
+            // 时才安装网络热路径 Hook，全部关闭时网络请求没有任何模块分支开销。
+            installNetworkVersionIdentityHook(classLoader);
             installAppVersionUtilityHook(classLoader);
             installAppVersionCodeUtilityHook(classLoader);
             installBuildConfigVersionHooks(classLoader);
@@ -1414,6 +1879,7 @@ public final class HeyBoxModule extends XposedModule {
                     "com.max.xiaoheihe.utils.AppUpdateManager", false, classLoader);
             appUpdateCheckMethod = updateManager.getMethod("r", Context.class);
             appUpdateCheckMethod.setAccessible(true);
+            recordHookGroup("版本检测");
             info("VERSION_CHECK_READY method=AppUpdateManager.r");
         } catch (Throwable throwable) {
             error("VERSION_CHECK_PREPARE_ERROR", throwable);
@@ -1543,6 +2009,7 @@ public final class HeyBoxModule extends XposedModule {
                 }
                 return chain.proceed();
             });
+            recordHookGroup("版本响应");
             info("HOOK_VERSION_RESPONSE_OK class=" + CHECK_VERSION_OBJECT);
         } catch (Throwable throwable) {
             error("HOOK_VERSION_RESPONSE_ERROR class=" + CHECK_VERSION_OBJECT, throwable);
@@ -1601,6 +2068,7 @@ public final class HeyBoxModule extends XposedModule {
                 // C() 是当前版本下载完成后的内部方法，旧版不存在时无需失败整个安装。
                 warn("HOOK_UPDATE_PROMPT_SKIP method=AppUpdateManager.C");
             }
+            recordHookGroup("更新弹窗");
             info("HOOK_UPDATE_PROMPT_OK methods=AppUpdateManager.v,w,B,C");
         } catch (Throwable throwable) {
             error("HOOK_UPDATE_PROMPT_ERROR", throwable);
@@ -1616,6 +2084,7 @@ public final class HeyBoxModule extends XposedModule {
                 Object result = chain.proceed();
                 return resolveSpoofVersion(stringValue(result));
             });
+            recordHookGroup("版本伪装");
             info("HOOK_VERSION_UTIL_OK method=com.max.xiaoheihe.utils.d.x0");
         } catch (Throwable throwable) {
             error("HOOK_VERSION_UTIL_ERROR method=com.max.xiaoheihe.utils.d.x0", throwable);
@@ -1981,6 +2450,15 @@ public final class HeyBoxModule extends XposedModule {
         shareTaskSnapshot = isEnabled(Config.KEY_SHARE_TASK, false);
         dailyShareTaskSnapshot = isEnabled(Config.KEY_DAILY_SHARE_TASK, false);
         skipSplashAdSnapshot = isEnabled(Config.KEY_SKIP_SPLASH_AD, false);
+        globalAdCleanSnapshot = isEnabled(Config.KEY_GLOBAL_AD_CLEAN, false);
+        disableClipboardTokenSnapshot = isEnabled(
+                Config.KEY_DISABLE_CLIPBOARD_TOKEN, false);
+        externalBrowserSnapshot = isEnabled(Config.KEY_EXTERNAL_BROWSER, false);
+        disableMediaAutoplaySnapshot = isEnabled(
+                Config.KEY_DISABLE_MEDIA_AUTOPLAY, false);
+        noForegroundRefreshSnapshot = isEnabled(
+                Config.KEY_NO_FOREGROUND_REFRESH, false);
+        imageEnhanceSnapshot = isEnabled(Config.KEY_IMAGE_ENHANCE, false);
         suppressUpdatePromptSnapshot = isEnabled(
                 Config.KEY_SUPPRESS_UPDATE_PROMPT, false);
         spoofVersionSnapshot = isEnabled(Config.KEY_SPOOF_VERSION, false);
@@ -1997,6 +2475,12 @@ public final class HeyBoxModule extends XposedModule {
                 + " share=" + shareTaskSnapshot
                 + " daily_share=" + dailyShareTaskSnapshot
                 + " splash=" + skipSplashAdSnapshot
+                + " global_ads=" + globalAdCleanSnapshot
+                + " clipboard=" + disableClipboardTokenSnapshot
+                + " external_browser=" + externalBrowserSnapshot
+                + " media_autoplay=" + disableMediaAutoplaySnapshot
+                + " no_foreground_refresh=" + noForegroundRefreshSnapshot
+                + " image_enhance=" + imageEnhanceSnapshot
                 + " suppress_update=" + suppressUpdatePromptSnapshot
                 + " spoof_version=" + spoofVersionSnapshot
                 + " mode=" + versionModeSnapshot
@@ -2329,6 +2813,117 @@ public final class HeyBoxModule extends XposedModule {
             return ((InvocationTargetException) throwable).getTargetException();
         }
         return throwable;
+    }
+
+    private void recordHookGroup(String group) {
+        synchronized (installedHookGroups) {
+            installedHookGroups.add(group);
+        }
+    }
+
+    /**
+     * 只在用户进入小黑盒设置页时注册按需自检接收器。平时启动首页不会启动模块
+     * 进程，也不会发送心跳、轮询或注册常驻任务。
+     */
+    @SuppressLint("UnspecifiedRegisterReceiverFlag")
+    @SuppressWarnings("deprecation")
+    private void ensureSelfCheckReceiver(Context context) {
+        if (context == null || selfCheckReceiverRegistered) {
+            return;
+        }
+        synchronized (this) {
+            if (selfCheckReceiverRegistered) {
+                return;
+            }
+            BroadcastReceiver receiver = new BroadcastReceiver() {
+                @Override
+                public void onReceive(Context receiverContext, Intent intent) {
+                    if (intent == null
+                            || !Config.ACTION_SELF_CHECK.equals(intent.getAction())
+                            || !isOrderedBroadcast()) {
+                        return;
+                    }
+                    Bundle status = new Bundle();
+                    status.putString("module_version", MODULE_VERSION);
+                    status.putString("target_version",
+                            readTargetVersion(receiverContext));
+                    status.putString("process", currentProcessName);
+                    synchronized (installedHookGroups) {
+                        status.putString("groups",
+                                String.join("、", installedHookGroups));
+                    }
+                    status.putString("enabled", enabledFeatureSummary());
+                    setResultCode(Activity.RESULT_OK);
+                    setResultExtras(status);
+                }
+            };
+            try {
+                IntentFilter filter = new IntentFilter(Config.ACTION_SELF_CHECK);
+                if (Build.VERSION.SDK_INT >= 33) {
+                    context.registerReceiver(
+                            receiver, filter, Context.RECEIVER_EXPORTED);
+                } else {
+                    context.registerReceiver(receiver, filter);
+                }
+                selfCheckReceiver = receiver;
+                selfCheckReceiverRegistered = true;
+                info("SELF_CHECK_RECEIVER_READY");
+            } catch (Throwable throwable) {
+                error("SELF_CHECK_RECEIVER_ERROR", throwable);
+            }
+        }
+    }
+
+    private static String readTargetVersion(Context context) {
+        try {
+            PackageInfo packageInfo = context.getPackageManager()
+                    .getPackageInfo(TARGET_PACKAGE, 0);
+            return stringValue(packageInfo.versionName)
+                    + " (" + getPackageVersionCode(packageInfo) + ")";
+        } catch (Throwable ignored) {
+            return "未知";
+        }
+    }
+
+    private String enabledFeatureSummary() {
+        List<String> enabled = new ArrayList<>();
+        if (hidePublishSnapshot) {
+            enabled.add("隐藏发布按钮");
+        }
+        if (globalAdCleanSnapshot) {
+            enabled.add("全局广告净化");
+        }
+        if (skipSplashAdSnapshot) {
+            enabled.add("跳过开屏广告");
+        }
+        if (disableClipboardTokenSnapshot) {
+            enabled.add("剪贴板保护");
+        }
+        if (shareTaskSnapshot) {
+            enabled.add("分享任务");
+        }
+        if (shareTaskSnapshot && dailyShareTaskSnapshot) {
+            enabled.add("每日任务");
+        }
+        if (externalBrowserSnapshot) {
+            enabled.add("外部浏览器");
+        }
+        if (disableMediaAutoplaySnapshot) {
+            enabled.add("媒体静止");
+        }
+        if (noForegroundRefreshSnapshot) {
+            enabled.add("禁止前台刷新");
+        }
+        if (imageEnhanceSnapshot) {
+            enabled.add("图片增强");
+        }
+        if (spoofVersionSnapshot) {
+            enabled.add("版本伪装");
+        }
+        if (suppressUpdatePromptSnapshot) {
+            enabled.add("屏蔽更新弹窗");
+        }
+        return String.join("、", enabled);
     }
 
     private void info(String message) {

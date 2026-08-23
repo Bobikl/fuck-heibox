@@ -2,6 +2,7 @@ package dev.heybox.hook;
 
 import android.app.Activity;
 import android.app.AlertDialog;
+import android.content.BroadcastReceiver;
 import android.content.Context;
 import android.content.Intent;
 import android.content.SharedPreferences;
@@ -32,6 +33,8 @@ import java.io.InputStreamReader;
 import java.net.HttpURLConnection;
 import java.net.URL;
 import java.nio.charset.StandardCharsets;
+import java.text.DateFormat;
+import java.util.Date;
 import java.util.Locale;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -57,6 +60,7 @@ public final class SettingsActivity extends Activity {
     private LinearLayout content;
     private TextView versionModeValue;
     private TextView versionStatus;
+    private TextView selfCheckStatus;
     private LinearLayout customVersionRow;
     private EditText customVersionInput;
     private EditText customVersionCodeInput;
@@ -76,6 +80,9 @@ public final class SettingsActivity extends Activity {
         super.onResume();
         if (versionStatus != null) {
             refreshVersionArea();
+        }
+        if (selfCheckStatus != null) {
+            refreshSelfCheck();
         }
     }
 
@@ -143,22 +150,52 @@ public final class SettingsActivity extends Activity {
                  Config.KEY_HIDE_PUBLISH, false));
         cleanCard.addView(createDivider());
         cleanCard.addView(createSwitchRow(
+                "全局广告净化", "移除信息流、首页气泡/角标、页内弹层及商城底栏广告",
+                 Config.KEY_GLOBAL_AD_CLEAN, false));
+        cleanCard.addView(createDivider());
+        cleanCard.addView(createSwitchRow(
+                "跳过开屏广告", "独立于全局净化；保留启动流程并跳过广告素材",
+                 Config.KEY_SKIP_SPLASH_AD, false));
+        cleanCard.addView(createDivider());
+        cleanCard.addView(createSwitchRow(
+                "禁止读取剪贴板口令", "阻止小黑盒启动/回前台时扫描剪贴板内容",
+                 Config.KEY_DISABLE_CLIPBOARD_TOKEN, false));
+        content.addView(cleanCard, cardMargins());
+
+        addSectionLabel("任务功能");
+        LinearLayout taskCard = createCard();
+        taskCard.addView(createSwitchRow(
                 "自动完成分享任务", "点击“去完成”后直接上报分享成功",
                  Config.KEY_SHARE_TASK, false));
-        cleanCard.addView(createDivider());
-        cleanCard.addView(createSwitchRow(
-                "首次启动自动完成分享任务", "每天第一次启动并加载任务后自动执行一次",
+        taskCard.addView(createDivider());
+        taskCard.addView(createSwitchRow(
+                "首次启动自动完成分享任务", "每天每个账号只执行一次；需要同时开启上一项",
                  Config.KEY_DAILY_SHARE_TASK, false));
-        cleanCard.addView(createDivider());
-        cleanCard.addView(createSwitchRow(
-                "跳过开屏广告", "保留原启动流程，仅跳过广告素材",
-                 Config.KEY_SKIP_SPLASH_AD, false));
-        content.addView(cleanCard, cardMargins());
+        content.addView(taskCard, cardMargins());
+
+        addSectionLabel("浏览与媒体");
+        LinearLayout experienceCard = createCard();
+        experienceCard.addView(createSwitchRow(
+                "使用外部浏览器打开链接", "普通 http/https 链接交给外部浏览器，内部协议保留",
+                 Config.KEY_EXTERNAL_BROWSER, false));
+        experienceCard.addView(createDivider());
+        experienceCard.addView(createSwitchRow(
+                "禁止视频/GIF 自动播放", "推荐流视频保留手动播放；GIF 默认显示静态首帧",
+                 Config.KEY_DISABLE_MEDIA_AUTOPLAY, false));
+        experienceCard.addView(createDivider());
+        experienceCard.addView(createSwitchRow(
+                "回前台不自动刷新", "保留签到状态同步，仅阻止首页超时后整页刷新",
+                 Config.KEY_NO_FOREGROUND_REFRESH, false));
+        experienceCard.addView(createDivider());
+        experienceCard.addView(createSwitchRow(
+                "图片体验增强", "进入图片查看器后自动请求服务器原图",
+                 Config.KEY_IMAGE_ENHANCE, false));
+        content.addView(experienceCard, cardMargins());
 
         addSectionLabel("版本兼容");
         LinearLayout versionCard = createCard();
         versionCard.addView(createSwitchRow(
-                "伪装应用版本", "对小黑盒自身的版本读取返回目标版本",
+                "伪装应用版本", "对小黑盒自身的 versionName / versionCode 读取返回目标值",
                  Config.KEY_SPOOF_VERSION, false));
         versionCard.addView(createDivider());
         versionCard.addView(createSwitchRow(
@@ -173,7 +210,7 @@ public final class SettingsActivity extends Activity {
         content.addView(versionCard, cardMargins());
 
         TextView note = new TextView(this);
-        note.setText("自动模式从小米应用商店公开接口同时获取 versionName 与 versionCode，并在本机缓存。获取失败时可切换到自定义模式。设置在重启小黑盒后完全生效。");
+        note.setText("自动模式从小米应用商店公开接口同时获取 versionName 与 versionCode，并在本机缓存。获取失败时可切换到自定义模式。所有开关默认关闭，设置在重启小黑盒后完全生效；关闭的功能不会安装对应 Hook。");
         note.setTextColor(COLOR_SECONDARY);
         note.setTextSize(12);
         note.setLineSpacing(dp(2), 1f);
@@ -182,16 +219,7 @@ public final class SettingsActivity extends Activity {
         noteParams.setMargins(dp(12), dp(10), dp(12), 0);
         content.addView(note, noteParams);
 
-        TextView openUpdateCheck = new TextView(this);
-        openUpdateCheck.setText("获取小黑盒最新版本");
-        openUpdateCheck.setTextColor(COLOR_PRIMARY);
-        openUpdateCheck.setTextSize(14);
-        openUpdateCheck.setTypeface(Typeface.DEFAULT, Typeface.BOLD);
-        openUpdateCheck.setGravity(Gravity.CENTER);
-        GradientDrawable updateBackground = new GradientDrawable();
-        updateBackground.setColor(COLOR_ACCENT);
-        updateBackground.setCornerRadius(dp(8));
-        openUpdateCheck.setBackground(updateBackground);
+        TextView openUpdateCheck = createActionButton("获取小黑盒最新版本");
         openUpdateCheck.setOnClickListener(view -> {
             openUpdateCheck.setEnabled(false);
             openUpdateCheck.setText("正在获取…");
@@ -214,14 +242,119 @@ public final class SettingsActivity extends Activity {
         testParams.setMargins(dp(12), dp(2), dp(12), 0);
         content.addView(testVersionCheck, testParams);
 
+        addSectionLabel("模块自检");
+        LinearLayout selfCheckCard = createCard();
+        selfCheckStatus = createInfoRow("Hook 状态", "正在读取…");
+        selfCheckStatus.setLineSpacing(dp(2), 1f);
+        selfCheckCard.addView(selfCheckStatus);
+        selfCheckCard.addView(createDivider());
+        TextView refreshSelfCheck = createPlainActionRow("刷新自检结果");
+        refreshSelfCheck.setOnClickListener(view -> refreshSelfCheck());
+        selfCheckCard.addView(refreshSelfCheck);
+        content.addView(selfCheckCard, cardMargins());
+
         LinearLayout.LayoutParams scrollParams = new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f);
         root.addView(scrollView, scrollParams);
         return root;
     }
 
+    private TextView createActionButton(String text) {
+        TextView button = new TextView(this);
+        button.setText(text);
+        button.setTextColor(COLOR_PRIMARY);
+        button.setTextSize(14);
+        button.setTypeface(Typeface.DEFAULT, Typeface.BOLD);
+        button.setGravity(Gravity.CENTER);
+        GradientDrawable background = new GradientDrawable();
+        background.setColor(COLOR_ACCENT);
+        background.setCornerRadius(dp(8));
+        button.setBackground(background);
+        return button;
+    }
+
+    private TextView createPlainActionRow(String text) {
+        TextView action = new TextView(this);
+        action.setText(text);
+        action.setTextColor(COLOR_PRIMARY);
+        action.setTextSize(14);
+        action.setTypeface(Typeface.DEFAULT, Typeface.BOLD);
+        action.setGravity(Gravity.CENTER);
+        action.setPadding(dp(16), dp(12), dp(16), dp(12));
+        action.setMinimumHeight(dp(48));
+        return action;
+    }
+
+    @SuppressWarnings("deprecation")
+    private void refreshSelfCheck() {
+        if (selfCheckStatus == null) {
+            return;
+        }
+        VersionIdentity installed = getInstalledTargetVersion();
+        if (installed.code <= 0L) {
+            selfCheckStatus.setText("Hook 状态  未安装小黑盒\n模块版本  "
+                    + Config.MODULE_VERSION);
+            return;
+        }
+        selfCheckStatus.setText("Hook 状态  正在实时检测…\n模块版本  "
+                + Config.MODULE_VERSION + "\n目标版本  " + installed.name
+                + " (" + installed.code + ")");
+        try {
+            Intent request = new Intent(Config.ACTION_SELF_CHECK);
+            request.setPackage(Config.TARGET_PACKAGE);
+            sendOrderedBroadcast(request, null, new BroadcastReceiver() {
+                @Override
+                public void onReceive(Context context, Intent intent) {
+                    if (isFinishing() || isDestroyed() || selfCheckStatus == null) {
+                        return;
+                    }
+                    Bundle result = getResultExtras(false);
+                    String reportedModule = result == null ? ""
+                            : result.getString("module_version", "");
+                    String reportedTarget = result == null ? ""
+                            : result.getString("target_version", "");
+                    String process = result == null ? ""
+                            : result.getString("process", "");
+                    String groups = result == null ? ""
+                            : result.getString("groups", "");
+                    String enabled = result == null ? ""
+                            : result.getString("enabled", "");
+                    boolean current = getResultCode() == Activity.RESULT_OK
+                            && Config.MODULE_VERSION.equals(reportedModule);
+                    String status = current ? "Hook 已注入且响应正常"
+                            : "未收到当前版本 Hook 响应";
+                    String time = DateFormat.getTimeInstance(
+                            DateFormat.MEDIUM, Locale.getDefault())
+                            .format(new Date());
+                    selfCheckStatus.setText("Hook 状态  " + status
+                            + "\n模块版本  " + Config.MODULE_VERSION
+                            + (reportedModule.isEmpty()
+                            ? "" : "（响应 " + reportedModule + "）")
+                            + "\n目标版本  " + installed.name + " (" + installed.code + ")"
+                            + (reportedTarget.isEmpty()
+                            ? "" : "\n进程读取版本  " + reportedTarget)
+                            + "\n目标进程  " + (process.isEmpty() ? "未响应" : process)
+                            + "\n检测时间  " + time
+                            + "\n已安装组  " + (groups.isEmpty() ? "无" : groups)
+                            + "\n已启用功能  " + (enabled.isEmpty() ? "无" : enabled));
+                }
+            }, null, Activity.RESULT_CANCELED, null, null);
+        } catch (Throwable throwable) {
+            selfCheckStatus.setText("Hook 状态  无法读取自检数据\n模块版本  "
+                    + Config.MODULE_VERSION + "\n目标版本  " + installed.name
+                    + " (" + installed.code + ")\n原因  "
+                    + throwable.getClass().getSimpleName());
+        }
+    }
+
     /** 目标 APK 没有可见的“检查更新”按钮时，用其内部更新管理器做一次诊断请求。 */
     private void requestTargetVersionCheck() {
+        if (!preferences.getBoolean(Config.KEY_SPOOF_VERSION, false)) {
+            Toast.makeText(this,
+                    "请先开启“伪装应用版本”并重启小黑盒，再运行检测",
+                    Toast.LENGTH_LONG).show();
+            return;
+        }
         try {
             // MainActivity 在目标 APK 清单中未导出，跨应用显式启动会触发
             // SecurityException。使用目标应用真正导出的 Launcher/SplashActivity，
