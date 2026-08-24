@@ -2,12 +2,12 @@ package dev.heybox.hook;
 
 /** 模块设置项；Hook 进程通过 Modern Xposed RemotePreferences 读取同一份数据。 */
 public final class Config {
-    public static final String MODULE_VERSION = "0.6.1";
+    public static final String MODULE_VERSION = "0.6.2";
     public static final String MODULE_PACKAGE = "dev.heybox.hook";
     public static final String TARGET_PACKAGE = "com.max.xiaoheihe";
     public static final String PREFS_NAME = "heybox_hook";
     public static final String ACTION_SELF_CHECK =
-            "dev.heybox.hook.action.SELF_CHECK_061";
+            "dev.heybox.hook.action.SELF_CHECK_062";
 
     public static final String KEY_HIDE_PUBLISH = "hide_publish";
     public static final String KEY_SHARE_TASK = "share_task";

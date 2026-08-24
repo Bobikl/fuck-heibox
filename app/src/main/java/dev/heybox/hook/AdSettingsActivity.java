@@ -33,7 +33,7 @@ public final class AdSettingsActivity extends Activity {
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
-        preferences = getSharedPreferences(Config.PREFS_NAME, MODE_PRIVATE);
+        preferences = HookApplication.getPreferences(this);
         configureWindow();
         setContentView(createPage());
     }

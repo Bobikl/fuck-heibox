@@ -9,6 +9,7 @@
     </queries>
 
     <application
+        android:name=".HookApplication"
         android:allowBackup="false"
         android:description="@string/module_description"
         android:hasCode="true"
