@@ -1,13 +1,14 @@
 package dev.heybox.hook;
 
-/** 模块设置项；Hook 进程通过 Modern Xposed RemotePreferences 读取同一份数据。 */
+/** 模块设置项；设置页与 Hook 共同读写小黑盒主进程中的宿主配置。 */
 public final class Config {
-    public static final String MODULE_VERSION = "0.6.2";
+    public static final String MODULE_VERSION = "0.7.0";
     public static final String MODULE_PACKAGE = "dev.heybox.hook";
     public static final String TARGET_PACKAGE = "com.max.xiaoheihe";
     public static final String PREFS_NAME = "heybox_hook";
-    public static final String ACTION_SELF_CHECK =
-            "dev.heybox.hook.action.SELF_CHECK_062";
+    /** 配置现在直接保存在目标应用主进程中，避免启动模块自身进程。 */
+    public static final String HOST_PREFS_NAME = "heybox_hook_config";
+    public static final String KEY_HOST_PREFS_MIGRATED = "host_prefs_migrated_v1";
 
     public static final String KEY_HIDE_PUBLISH = "hide_publish";
     public static final String KEY_SHARE_TASK = "share_task";
@@ -38,9 +39,6 @@ public final class Config {
 
     public static final String VERSION_MODE_AUTO = "auto";
     public static final String VERSION_MODE_CUSTOM = "custom";
-
-    public static final String URI_REQUEST_VERSION_CHECK =
-            "xiaoheihe://heyboxhook/version-check";
 
     private Config() {
     }

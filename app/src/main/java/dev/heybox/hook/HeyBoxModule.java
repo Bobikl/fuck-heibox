@@ -1,12 +1,10 @@
 package dev.heybox.hook;
 
-import android.annotation.SuppressLint;
 import android.app.Activity;
-import android.content.BroadcastReceiver;
-import android.content.ComponentName;
+import android.app.Application;
+import android.app.Instrumentation;
 import android.content.Context;
 import android.content.Intent;
-import android.content.IntentFilter;
 import android.content.SharedPreferences;
 import android.content.res.Resources;
 import android.content.pm.PackageInfo;
@@ -96,6 +94,7 @@ public final class HeyBoxModule extends XposedModule {
 
     private boolean hooksInstalled;
     private SharedPreferences preferences;
+    private SharedPreferences remoteMigrationPreferences;
     private volatile Context targetContext;
     private volatile WeakReference<Activity> lastTargetActivity = new WeakReference<>(null);
     private Method appUpdateCheckMethod;
@@ -144,14 +143,15 @@ public final class HeyBoxModule extends XposedModule {
     private volatile int[] centerNavigationIds;
     private String currentProcessName = "";
     private final Set<String> installedHookGroups = new LinkedHashSet<>();
-    private BroadcastReceiver selfCheckReceiver;
-    private volatile boolean selfCheckReceiverRegistered;
 
     @Override
     public void onModuleLoaded(ModuleLoadedParam param) {
         currentProcessName = param.getProcessName();
         try {
-            preferences = getRemotePreferences(Config.PREFS_NAME);
+            // 0.6.x 使用 LSPosed Remote Preferences。0.7.0 首次启动时只读
+            // 一次旧配置并迁移到小黑盒自己的私有配置，之后设置页和 Hook
+            // 位于同一进程，不再需要启动模块应用或保持 Binder 服务。
+            remoteMigrationPreferences = getRemotePreferences(Config.PREFS_NAME);
         } catch (Throwable throwable) {
             error("PREFERENCES_INIT_ERROR", throwable);
         }
@@ -172,6 +172,91 @@ public final class HeyBoxModule extends XposedModule {
             return;
         }
 
+        ClassLoader classLoader = param.getClassLoader();
+        info("PKG_READY package=" + param.getPackageName()
+                + " loader=" + classLoader.getClass().getName());
+
+        Context currentApplication = findCurrentApplication();
+        if (currentApplication != null) {
+            initializeTargetSafely(currentApplication, classLoader);
+            return;
+        }
+        installHostContextBootstrap(classLoader);
+    }
+
+    /**
+     * PackageReady 早于 Application.attach 时通过一次性启动 Hook 获取宿主 Context。
+     * Application.attach 是 final 方法，不受目标自定义 Application 覆盖影响；完成
+     * 初始化后不会再进入任何页面或网络热路径。
+     */
+    private void installHostContextBootstrap(ClassLoader classLoader) {
+        boolean installed = false;
+        try {
+            Method attach = Application.class.getDeclaredMethod("attach", Context.class);
+            attach.setAccessible(true);
+            hook(attach).intercept(chain -> {
+                Object result = chain.proceed();
+                Context context = (Context) chain.getArg(0);
+                if (context != null
+                        && TARGET_PACKAGE.equals(context.getPackageName())) {
+                    initializeTargetSafely(context, classLoader);
+                }
+                return result;
+            });
+            info("HOST_CONTEXT_BOOTSTRAP_READY method=Application.attach");
+            installed = true;
+        } catch (Throwable throwable) {
+            warn("HOST_CONTEXT_BOOTSTRAP_SKIP method=Application.attach reason="
+                    + throwable.getClass().getSimpleName());
+        }
+        try {
+            Method callOnCreate = Instrumentation.class.getMethod(
+                    "callApplicationOnCreate", Application.class);
+            hook(callOnCreate).intercept(chain -> {
+                Application application = (Application) chain.getArg(0);
+                if (application != null
+                        && TARGET_PACKAGE.equals(application.getPackageName())) {
+                    // 在宿主 Application.onCreate 前完成配置快照与功能 Hook，
+                    // SplashActivity 创建前所有启用功能已准备完成。
+                    initializeTargetSafely(application, classLoader);
+                }
+                return chain.proceed();
+            });
+            info("HOST_CONTEXT_BOOTSTRAP_READY method=Instrumentation.callApplicationOnCreate");
+            installed = true;
+        } catch (Throwable throwable) {
+            warn("HOST_CONTEXT_BOOTSTRAP_SKIP method=Instrumentation.callApplicationOnCreate reason="
+                    + throwable.getClass().getSimpleName());
+        }
+        if (!installed) {
+            error("HOST_CONTEXT_BOOTSTRAP_ERROR",
+                    new IllegalStateException("No context bootstrap method available"));
+        }
+    }
+
+    private Context findCurrentApplication() {
+        try {
+            Class<?> activityThread = Class.forName("android.app.ActivityThread");
+            Method currentApplication = activityThread.getDeclaredMethod("currentApplication");
+            currentApplication.setAccessible(true);
+            Object application = currentApplication.invoke(null);
+            return application instanceof Context ? (Context) application : null;
+        } catch (Throwable ignored) {
+            return null;
+        }
+    }
+
+    private void initializeTargetSafely(Context context, ClassLoader classLoader) {
+        try {
+            initializeTarget(context, classLoader);
+        } catch (Throwable throwable) {
+            // 启动引导绝不能把异常传回 Application.attach，否则设置功能的一次
+            // 兼容问题会直接导致整个小黑盒启动失败。
+            error("HOST_INITIALIZE_ERROR", unwrap(throwable));
+        }
+    }
+
+    private void initializeTarget(Context context, ClassLoader classLoader) {
         synchronized (this) {
             if (hooksInstalled) {
                 return;
@@ -179,15 +264,16 @@ public final class HeyBoxModule extends XposedModule {
             hooksInstalled = true;
         }
 
-        ClassLoader classLoader = param.getClassLoader();
-        info("PKG_READY package=" + param.getPackageName()
-                + " loader=" + classLoader.getClass().getName());
+        Context applicationContext = context.getApplicationContext();
+        targetContext = applicationContext == null ? context : applicationContext;
+        preferences = targetContext.getSharedPreferences(
+                Config.HOST_PREFS_NAME, Context.MODE_PRIVATE);
+        migrateRemotePreferencesIfNeeded(preferences);
 
         loadFeatureConfigSnapshot();
 
         if (hidePublishSnapshot
-                || (shareTaskSnapshot && dailyShareTaskSnapshot)
-                || spoofVersionSnapshot) {
+                || (shareTaskSnapshot && dailyShareTaskSnapshot)) {
             installMainUiHooks(classLoader);
         }
         if (shareTaskSnapshot) {
@@ -228,6 +314,49 @@ public final class HeyBoxModule extends XposedModule {
         if (postTextSelectSnapshot) {
             installPostTextSelectionHook(classLoader);
         }
+        info("HOST_CONFIG_READY storage=" + Config.HOST_PREFS_NAME);
+    }
+
+    private void migrateRemotePreferencesIfNeeded(SharedPreferences hostPreferences) {
+        if (hostPreferences.getBoolean(Config.KEY_HOST_PREFS_MIGRATED, false)) {
+            remoteMigrationPreferences = null;
+            return;
+        }
+        SharedPreferences.Editor editor = hostPreferences.edit();
+        int migrated = 0;
+        SharedPreferences legacy = remoteMigrationPreferences;
+        if (legacy != null) {
+            try {
+                for (Map.Entry<String, ?> entry : legacy.getAll().entrySet()) {
+                    Object value = entry.getValue();
+                    String key = entry.getKey();
+                    if (value instanceof String) {
+                        editor.putString(key, (String) value);
+                    } else if (value instanceof Boolean) {
+                        editor.putBoolean(key, (Boolean) value);
+                    } else if (value instanceof Integer) {
+                        editor.putInt(key, (Integer) value);
+                    } else if (value instanceof Long) {
+                        editor.putLong(key, (Long) value);
+                    } else if (value instanceof Float) {
+                        editor.putFloat(key, (Float) value);
+                    } else if (value instanceof Set<?>) {
+                        @SuppressWarnings("unchecked")
+                        Set<String> values = (Set<String>) value;
+                        editor.putStringSet(key, new LinkedHashSet<>(values));
+                    } else {
+                        continue;
+                    }
+                    migrated++;
+                }
+            } catch (Throwable throwable) {
+                warn("HOST_CONFIG_MIGRATION_READ_ERROR "
+                        + throwable.getClass().getSimpleName());
+            }
+        }
+        editor.putBoolean(Config.KEY_HOST_PREFS_MIGRATED, true).commit();
+        remoteMigrationPreferences = null;
+        info("HOST_CONFIG_MIGRATED count=" + migrated);
     }
 
     private void installMainUiHooks(ClassLoader classLoader) {
@@ -251,11 +380,6 @@ public final class HeyBoxModule extends XposedModule {
                 if (hidePublishSnapshot) {
                     hideCenterNavigation(activity, "onCreate");
                 }
-                // Activity 完成初始化后再触发内部检查，避免更新管理器拿到未完成
-                // 初始化的上下文；SplashActivity 深链路径仍由其自身 Hook 处理。
-                if (spoofVersionSnapshot) {
-                    handleVersionCheckRequest(activity);
-                }
                 return result;
             });
 
@@ -277,26 +401,13 @@ public final class HeyBoxModule extends XposedModule {
                 });
             }
 
-            if (spoofVersionSnapshot) {
-                Method onNewIntent = mainActivityClass.getDeclaredMethod(
-                        "onNewIntent", Intent.class);
-                onNewIntent.setAccessible(true);
-                hook(onNewIntent).intercept(chain -> {
-                    Object result = chain.proceed();
-                    Activity activity = (Activity) chain.getThisObject();
-                    lastTargetActivity = new WeakReference<>(activity);
-                    handleVersionCheckRequest(activity);
-                    return result;
-                });
-            }
-
             recordHookGroup("基础/自检");
             if (hidePublishSnapshot) {
                 recordHookGroup("隐藏发布按钮");
             }
             info("HOOK_UI_OK class=" + MAIN_ACTIVITY
                     + " resume=" + needsResumeHook
-                    + " new_intent=" + spoofVersionSnapshot);
+                    + " new_intent=false");
         } catch (Throwable throwable) {
             error("HOOK_UI_ERROR class=" + MAIN_ACTIVITY, throwable);
         }
@@ -1295,17 +1406,6 @@ public final class HeyBoxModule extends XposedModule {
             hook(splashInitialize).intercept(chain -> {
                 Activity splash = (Activity) chain.getThisObject();
                 targetContext = splash.getApplicationContext();
-                if (splash.getIntent() != null
-                        && splash.getIntent().getData() != null
-                        && Config.URI_REQUEST_VERSION_CHECK.equals(
-                        splash.getIntent().getData().toString())) {
-                    lastTargetActivity = new WeakReference<>(splash);
-                    // 用完整初始化路径处理一次内部版本检测请求，完成后仍由广告
-                    // 选择器 Hook 保证不会显示开屏广告。
-                    Object result = chain.proceed();
-                    handleVersionCheckRequest(splash);
-                    return result;
-                }
                 try {
                     // AdsActivity.onDestroy() 只读取 O.j。提前写入全空轻量 binding，
                     // 避免为了销毁流程在主线程 inflate 整套广告布局。
@@ -1881,8 +1981,6 @@ public final class HeyBoxModule extends XposedModule {
                 Activity activity = (Activity) chain.getThisObject();
                 targetContext = activity.getApplicationContext();
                 lastTargetActivity = new WeakReference<>(activity);
-                ensureSelfCheckReceiver(targetContext);
-                handleVersionCheckRequest(activity);
                 try {
                     addSettingsEntry(activity, itemConstructor, setTitle, setTitleDesc,
                             setRightDesc, setRightType, arrow);
@@ -1939,18 +2037,45 @@ public final class HeyBoxModule extends XposedModule {
 
     private void openModuleSettings(Activity activity) {
         try {
-            Intent intent = new Intent();
-            intent.setComponent(new ComponentName(
-                    Config.MODULE_PACKAGE, Config.MODULE_PACKAGE + ".SettingsActivity"));
-            // SettingsActivity 虽然由模块 APK 提供，但任务归属小黑盒；不创建模块自己的
-            // 最近任务卡片，返回键也会回到小黑盒原设置页。
-            intent.addFlags(Intent.FLAG_ACTIVITY_NO_ANIMATION);
-            activity.startActivity(intent);
-            activity.overridePendingTransition(0, 0);
-            info("SETTINGS_OPEN_OK");
+            if (activity.isFinishing() || activity.isDestroyed()) {
+                return;
+            }
+            HostSettingsDialog dialog = new HostSettingsDialog(
+                    activity,
+                    preferences,
+                    new HostSettingsDialog.RuntimeBridge() {
+                        @Override
+                        public String getSelfCheckReport() {
+                            return buildEmbeddedSelfCheckReport();
+                        }
+
+                        @Override
+                        public void requestVersionCheck() {
+                            requestVersionCheckFromSettings(activity);
+                        }
+                    });
+            dialog.show();
+            info("SETTINGS_OPEN_OK mode=host_dialog");
         } catch (Throwable throwable) {
             error("SETTINGS_OPEN_ERROR", throwable);
+            Toast.makeText(activity,
+                    "设置页打开失败：" + throwable.getClass().getSimpleName(),
+                    Toast.LENGTH_LONG).show();
         }
+    }
+
+    private String buildEmbeddedSelfCheckReport() {
+        String groups;
+        synchronized (installedHookGroups) {
+            groups = String.join("、", installedHookGroups);
+        }
+        String enabled = enabledFeatureSummary();
+        return "Hook 状态  已注入且响应正常"
+                + "\n模块版本  " + MODULE_VERSION
+                + "\n目标版本  " + readTargetVersion(targetContext)
+                + "\n目标进程  " + currentProcessName
+                + "\n已安装组  " + (groups.isEmpty() ? "无" : groups)
+                + "\n已启用功能  " + (enabled.isEmpty() ? "无" : enabled);
     }
 
     private ViewGroup.LayoutParams copyLayoutParams(ViewGroup.LayoutParams source) {
@@ -2008,15 +2133,11 @@ public final class HeyBoxModule extends XposedModule {
         }
     }
 
-    private void handleVersionCheckRequest(Activity activity) {
-        if (activity == null || activity.getIntent() == null
-                || activity.getIntent().getData() == null
-                || !Config.URI_REQUEST_VERSION_CHECK.equals(
-                activity.getIntent().getData().toString())) {
+    private void requestVersionCheckFromSettings(Activity activity) {
+        if (!spoofVersionSnapshot) {
+            showVersionCheckToast("请先开启“伪装应用版本”并重启小黑盒，再运行检测");
             return;
         }
-        // 清掉 data，避免 Activity 复用或配置变化时重复发起请求。
-        activity.getIntent().setData(null);
         lastTargetActivity = new WeakReference<>(activity);
         Method check = appUpdateCheckMethod;
         if (check == null) {
@@ -2565,7 +2686,7 @@ public final class HeyBoxModule extends XposedModule {
 
     /**
      * 版本号读取位于请求拦截器热路径中。配置只承诺重启目标应用后完全生效，
-     * 因此进程启动时读取一次，避免每个网络请求都跨进程访问 RemotePreferences。
+     * 因此进程启动时读取一次宿主配置，避免每个网络请求都访问 SharedPreferences。
      */
     private void loadFeatureConfigSnapshot() {
         hidePublishSnapshot = isEnabled(Config.KEY_HIDE_PUBLISH, false);
@@ -2957,59 +3078,6 @@ public final class HeyBoxModule extends XposedModule {
     private void recordHookGroup(String group) {
         synchronized (installedHookGroups) {
             installedHookGroups.add(group);
-        }
-    }
-
-    /**
-     * 只在用户进入小黑盒设置页时注册按需自检接收器。平时启动首页不会启动模块
-     * 进程，也不会发送心跳、轮询或注册常驻任务。
-     */
-    @SuppressLint("UnspecifiedRegisterReceiverFlag")
-    @SuppressWarnings("deprecation")
-    private void ensureSelfCheckReceiver(Context context) {
-        if (context == null || selfCheckReceiverRegistered) {
-            return;
-        }
-        synchronized (this) {
-            if (selfCheckReceiverRegistered) {
-                return;
-            }
-            BroadcastReceiver receiver = new BroadcastReceiver() {
-                @Override
-                public void onReceive(Context receiverContext, Intent intent) {
-                    if (intent == null
-                            || !Config.ACTION_SELF_CHECK.equals(intent.getAction())
-                            || !isOrderedBroadcast()) {
-                        return;
-                    }
-                    Bundle status = new Bundle();
-                    status.putString("module_version", MODULE_VERSION);
-                    status.putString("target_version",
-                            readTargetVersion(receiverContext));
-                    status.putString("process", currentProcessName);
-                    synchronized (installedHookGroups) {
-                        status.putString("groups",
-                                String.join("、", installedHookGroups));
-                    }
-                    status.putString("enabled", enabledFeatureSummary());
-                    setResultCode(Activity.RESULT_OK);
-                    setResultExtras(status);
-                }
-            };
-            try {
-                IntentFilter filter = new IntentFilter(Config.ACTION_SELF_CHECK);
-                if (Build.VERSION.SDK_INT >= 33) {
-                    context.registerReceiver(
-                            receiver, filter, Context.RECEIVER_EXPORTED);
-                } else {
-                    context.registerReceiver(receiver, filter);
-                }
-                selfCheckReceiver = receiver;
-                selfCheckReceiverRegistered = true;
-                info("SELF_CHECK_RECEIVER_READY");
-            } catch (Throwable throwable) {
-                error("SELF_CHECK_RECEIVER_ERROR", throwable);
-            }
         }
     }
 
