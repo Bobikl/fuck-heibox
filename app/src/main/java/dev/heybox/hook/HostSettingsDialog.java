@@ -589,7 +589,8 @@ final class HostSettingsDialog extends Dialog {
                 : (!isPlausibleVersion(cached) || !isPlausibleVersionCode(cachedCode)
                 ? "等待获取" : cached + " (" + cachedCode + ")");
         versionStatus.setText("当前目标  " + target
-                + "\n模块适配基准  1.3.347 (916)");
+                + "\n模块适配基准  " + Config.TARGET_BASE_VERSION
+                + " (" + Config.TARGET_BASE_VERSION_CODE + ")");
     }
 
     private void fetchLatestVersion(TextView button) {
@@ -653,8 +654,8 @@ final class HostSettingsDialog extends Dialog {
                             Toast.LENGTH_LONG).show();
                     return;
                 }
-                if (compareVersions(resultName, "1.3.347") < 0
-                        || resultCode < 916L) {
+                if (compareVersions(resultName, Config.TARGET_BASE_VERSION) < 0
+                        || resultCode < Config.TARGET_BASE_VERSION_CODE) {
                     Toast.makeText(host, "数据源版本低于模块适配基准，未写入",
                             Toast.LENGTH_LONG).show();
                     return;

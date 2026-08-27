@@ -2,9 +2,12 @@ package dev.heybox.hook;
 
 /** 模块设置项；设置页与 Hook 共同读写小黑盒主进程中的宿主配置。 */
 public final class Config {
-    public static final String MODULE_VERSION = "0.7.1";
+    /** 直接使用构建产物版本，避免与 build.gradle.kts 重复维护。 */
+    public static final String MODULE_VERSION = BuildConfig.VERSION_NAME;
     public static final String MODULE_PACKAGE = "dev.heybox.hook";
     public static final String TARGET_PACKAGE = "com.max.xiaoheihe";
+    public static final String TARGET_BASE_VERSION = "1.3.347";
+    public static final long TARGET_BASE_VERSION_CODE = 916L;
     public static final String PREFS_NAME = "heybox_hook";
     /** 配置现在直接保存在目标应用主进程中，避免启动模块自身进程。 */
     public static final String HOST_PREFS_NAME = "heybox_hook_config";

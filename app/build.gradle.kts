@@ -11,8 +11,8 @@ android {
         applicationId = "dev.heybox.hook"
         minSdk = 26
         targetSdk = 35
-        versionCode = 28
-        versionName = "0.7.1"
+        versionCode = 29
+        versionName = "0.7.2"
     }
 
     buildTypes {
@@ -25,6 +25,10 @@ android {
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
+    }
+
+    buildFeatures {
+        buildConfig = true
     }
 
     packaging {

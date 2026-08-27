@@ -95,8 +95,8 @@ public final class HeyBoxModule extends XposedModule {
     };
 
     private boolean hooksInstalled;
+    private boolean hooksInitializing;
     private SharedPreferences preferences;
-    private SharedPreferences remoteMigrationPreferences;
     private volatile Context targetContext;
     private volatile WeakReference<Activity> lastTargetActivity = new WeakReference<>(null);
     private Method appUpdateCheckMethod;
@@ -127,9 +127,9 @@ public final class HeyBoxModule extends XposedModule {
     private volatile long customVersionCodeSnapshot;
     private volatile String cachedLatestVersionSnapshot = "";
     private volatile long cachedLatestVersionCodeSnapshot;
-    /** 版本拦截热路径使用的基准值缓存（目标 APK 当前真实值为 1.3.347/916）。 */
-    private volatile String effectiveVersionSnapshot = "1.3.347";
-    private volatile long effectiveVersionCodeSnapshot = 916L;
+    /** 版本拦截热路径使用的基准值缓存。 */
+    private volatile String effectiveVersionSnapshot = Config.TARGET_BASE_VERSION;
+    private volatile long effectiveVersionCodeSnapshot = Config.TARGET_BASE_VERSION_CODE;
     private volatile boolean versionIdentityOverrideSnapshot;
     private volatile boolean dailyShareInProgress;
     private volatile boolean dailyShareFetchRequested;
@@ -149,14 +149,8 @@ public final class HeyBoxModule extends XposedModule {
     @Override
     public void onModuleLoaded(ModuleLoadedParam param) {
         currentProcessName = param.getProcessName();
-        try {
-            // 0.6.x 使用 LSPosed Remote Preferences。0.7.0 首次启动时只读
-            // 一次旧配置并迁移到小黑盒自己的私有配置，之后设置页和 Hook
-            // 位于同一进程，不再需要启动模块应用或保持 Binder 服务。
-            remoteMigrationPreferences = getRemotePreferences(Config.PREFS_NAME);
-        } catch (Throwable throwable) {
-            error("PREFERENCES_INIT_ERROR", throwable);
-        }
+        // 不在每次进程加载时初始化 Remote Preferences。0.6.x 的旧配置只在
+        // 宿主迁移标记不存在时按需读取一次，迁移完成后的启动路径没有 Binder 访问。
         info("BOOT module=" + MODULE_VERSION + " process=" + param.getProcessName()
                 + " framework=" + getFrameworkName()
                 + " api=" + getApiVersion());
@@ -258,21 +252,36 @@ public final class HeyBoxModule extends XposedModule {
         }
     }
 
-    private void initializeTarget(Context context, ClassLoader classLoader) {
+    private void initializeTarget(Context context, ClassLoader classLoader) throws Throwable {
         synchronized (this) {
-            if (hooksInstalled) {
+            if (hooksInstalled || hooksInitializing) {
                 return;
             }
-            hooksInstalled = true;
+            hooksInitializing = true;
         }
 
-        Context applicationContext = context.getApplicationContext();
-        targetContext = applicationContext == null ? context : applicationContext;
-        preferences = targetContext.getSharedPreferences(
-                Config.HOST_PREFS_NAME, Context.MODE_PRIVATE);
-        migrateRemotePreferencesIfNeeded(preferences);
+        try {
+            Context applicationContext = context.getApplicationContext();
+            targetContext = applicationContext == null ? context : applicationContext;
+            preferences = targetContext.getSharedPreferences(
+                    Config.HOST_PREFS_NAME, Context.MODE_PRIVATE);
+            migrateRemotePreferencesIfNeeded(preferences);
+            loadFeatureConfigSnapshot();
+        } catch (Throwable throwable) {
+            // 配置准备阶段尚未安装任何功能 Hook，可以安全释放初始化状态，
+            // 让后续的 Application.onCreate 引导或下一次调用重试。
+            synchronized (this) {
+                hooksInitializing = false;
+            }
+            throw throwable;
+        }
 
-        loadFeatureConfigSnapshot();
+        // 从此处开始各安装器可能已经注册 Hook。即使某个可选功能不兼容，也不能
+        // 整体重试，否则已经成功的 Hook 会被重复注册。
+        synchronized (this) {
+            hooksInstalled = true;
+            hooksInitializing = false;
+        }
 
         if (hidePublishSnapshot
                 || (shareTaskSnapshot && dailyShareTaskSnapshot)) {
@@ -321,12 +330,21 @@ public final class HeyBoxModule extends XposedModule {
 
     private void migrateRemotePreferencesIfNeeded(SharedPreferences hostPreferences) {
         if (hostPreferences.getBoolean(Config.KEY_HOST_PREFS_MIGRATED, false)) {
-            remoteMigrationPreferences = null;
             return;
         }
         SharedPreferences.Editor editor = hostPreferences.edit();
         int migrated = 0;
-        SharedPreferences legacy = remoteMigrationPreferences;
+        SharedPreferences legacy = null;
+        try {
+            // 仅首次迁移进入这里。迁移标记写入后，后续进程启动不会再创建
+            // LSPosed Remote Preferences 连接。
+            legacy = getRemotePreferences(Config.PREFS_NAME);
+        } catch (Throwable throwable) {
+            warn("HOST_CONFIG_MIGRATION_OPEN_ERROR "
+                    + unwrap(throwable).getClass().getSimpleName());
+            // 不写迁移完成标记，下次启动仍有机会读取旧配置。
+            return;
+        }
         if (legacy != null) {
             try {
                 for (Map.Entry<String, ?> entry : legacy.getAll().entrySet()) {
@@ -354,10 +372,13 @@ public final class HeyBoxModule extends XposedModule {
             } catch (Throwable throwable) {
                 warn("HOST_CONFIG_MIGRATION_READ_ERROR "
                         + throwable.getClass().getSimpleName());
+                // 读取失败时不把空配置标记成迁移完成。
+                return;
             }
         }
-        editor.putBoolean(Config.KEY_HOST_PREFS_MIGRATED, true).commit();
-        remoteMigrationPreferences = null;
+        // SharedPreferences.apply() 会立即更新当前进程内存值，并异步落盘，避免在
+        // Application 启动主线程上执行同步 fsync。
+        editor.putBoolean(Config.KEY_HOST_PREFS_MIGRATED, true).apply();
         info("HOST_CONFIG_MIGRATED count=" + migrated);
     }
 
@@ -2342,8 +2363,9 @@ public final class HeyBoxModule extends XposedModule {
         try {
             Class<?> buildConfig = Class.forName("com.max.xiaoheihe.a", false, classLoader);
             setStaticStringField(buildConfig, "g",
-                    String.valueOf(resolveSpoofVersionCode(916L)));
-            setStaticStringField(buildConfig, "h", resolveSpoofVersion("1.3.347"));
+                    String.valueOf(resolveSpoofVersionCode(Config.TARGET_BASE_VERSION_CODE)));
+            setStaticStringField(buildConfig, "h",
+                    resolveSpoofVersion(Config.TARGET_BASE_VERSION));
             info("HOOK_BUILD_CONFIG_OK class=com.max.xiaoheihe.a fields=g,h");
         } catch (Throwable throwable) {
             error("HOOK_BUILD_CONFIG_ERROR class=com.max.xiaoheihe.a", throwable);
@@ -2563,7 +2585,7 @@ public final class HeyBoxModule extends XposedModule {
             return real;
         }
 
-        if ("1.3.347".equals(real)
+        if (Config.TARGET_BASE_VERSION.equals(real)
                 && isPlausibleVersion(effectiveVersionSnapshot)) {
             return effectiveVersionSnapshot;
         }
@@ -2580,7 +2602,7 @@ public final class HeyBoxModule extends XposedModule {
         String latest = cachedLatestVersionSnapshot;
         if (!isPlausibleVersion(latest)
                 || !isPlausibleVersionCode(cachedLatestVersionCodeSnapshot)
-                || cachedLatestVersionCodeSnapshot < 916L
+                || cachedLatestVersionCodeSnapshot < Config.TARGET_BASE_VERSION_CODE
                 || compareVersions(latest, real) < 0) {
             return real;
         }
@@ -2592,7 +2614,8 @@ public final class HeyBoxModule extends XposedModule {
             return realVersionCode;
         }
 
-        if (realVersionCode == 916L && isPlausibleVersionCode(effectiveVersionCodeSnapshot)) {
+        if (realVersionCode == Config.TARGET_BASE_VERSION_CODE
+                && isPlausibleVersionCode(effectiveVersionCodeSnapshot)) {
             return effectiveVersionCodeSnapshot;
         }
         if (Config.VERSION_MODE_CUSTOM.equals(versionModeSnapshot)) {
@@ -2603,15 +2626,16 @@ public final class HeyBoxModule extends XposedModule {
         long latestCode = cachedLatestVersionCodeSnapshot;
         // versionCode 单调递增；更新应用后不使用更低的旧缓存。
         return isPlausibleVersion(cachedLatestVersionSnapshot)
-                && compareVersions(cachedLatestVersionSnapshot, "1.3.347") >= 0
+                && compareVersions(cachedLatestVersionSnapshot,
+                        Config.TARGET_BASE_VERSION) >= 0
                 && isPlausibleVersionCode(latestCode) && latestCode >= realVersionCode
                 ? latestCode : realVersionCode;
     }
 
     /** 预计算目标 APK 当前基准版本的伪装结果，减少网络拦截器中的重复比较。 */
     private void refreshEffectiveVersionSnapshot() {
-        String effectiveName = "1.3.347";
-        long effectiveCode = 916L;
+        String effectiveName = Config.TARGET_BASE_VERSION;
+        long effectiveCode = Config.TARGET_BASE_VERSION_CODE;
         if (!spoofVersionSnapshot) {
             effectiveVersionSnapshot = effectiveName;
             effectiveVersionCodeSnapshot = effectiveCode;
@@ -2627,16 +2651,18 @@ public final class HeyBoxModule extends XposedModule {
         } else {
             if (isPlausibleVersion(cachedLatestVersionSnapshot)
                     && isPlausibleVersionCode(cachedLatestVersionCodeSnapshot)
-                    && compareVersions(cachedLatestVersionSnapshot, "1.3.347") >= 0
-                    && cachedLatestVersionCodeSnapshot >= 916L) {
+                    && compareVersions(cachedLatestVersionSnapshot,
+                            Config.TARGET_BASE_VERSION) >= 0
+                    && cachedLatestVersionCodeSnapshot
+                            >= Config.TARGET_BASE_VERSION_CODE) {
                 effectiveName = cachedLatestVersionSnapshot;
                 effectiveCode = cachedLatestVersionCodeSnapshot;
             }
         }
         effectiveVersionSnapshot = effectiveName;
         effectiveVersionCodeSnapshot = effectiveCode;
-        versionIdentityOverrideSnapshot = !"1.3.347".equals(effectiveName)
-                || effectiveCode != 916L;
+        versionIdentityOverrideSnapshot = !Config.TARGET_BASE_VERSION.equals(effectiveName)
+                || effectiveCode != Config.TARGET_BASE_VERSION_CODE;
     }
 
     private void applySpoofPackageIdentity(PackageInfo packageInfo) {
