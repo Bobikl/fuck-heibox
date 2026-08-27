@@ -233,7 +233,7 @@ final class HostSettingsDialog extends Dialog {
                 Config.KEY_DISABLE_MEDIA_AUTOPLAY, false));
         experienceCard.addView(createDivider());
         experienceCard.addView(createSwitchRow(
-                "回前台不自动刷新", "保留签到同步，仅阻止首页超时整页刷新",
+                "返回首页不自动刷新", "从其他底部页面返回首页时保留当前位置；手动下拉刷新不受影响",
                 Config.KEY_NO_FOREGROUND_REFRESH, false));
         experienceCard.addView(createDivider());
         experienceCard.addView(createSwitchRow(

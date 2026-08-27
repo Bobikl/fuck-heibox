@@ -71,6 +71,8 @@ public final class HeyBoxModule extends XposedModule {
     private static final String SPLASH_ACTIVITY = "com.max.xiaoheihe.SplashActivity";
     private static final String TARGET_SETTINGS_ACTIVITY =
             "com.max.xiaoheihe.module.account.SettingActivity";
+    private static final String HOME_GO_TOP_ACTION =
+            "com.max.xiaoheihe.news.gotop";
     private static final String SETTING_ITEM_VIEW =
             "com.max.xiaoheihe.module.account.component.SettingItemView";
     private static final String CHECK_VERSION_OBJECT =
@@ -306,7 +308,7 @@ public final class HeyBoxModule extends XposedModule {
             installMediaAutoplayHooks(classLoader);
         }
         if (noForegroundRefreshSnapshot) {
-            installForegroundRefreshHook(classLoader);
+            installHomeReturnRefreshHook(classLoader);
         }
         if (imageEnhanceSnapshot) {
             installImageEnhancementHook(classLoader);
@@ -1793,36 +1795,33 @@ public final class HeyBoxModule extends XposedModule {
         return false;
     }
 
-    private void installForegroundRefreshHook(ClassLoader classLoader) {
+    /**
+     * 阻止点击底部“首页”时发送的回顶刷新指令。
+     *
+     * <p>MainActivity 会在首页按钮的点击回调中广播
+     * {@code com.max.xiaoheihe.news.gotop}，DiscoveryFragment 收到后调用当前首页
+     * 子页面的 D3()，最终触发列表回顶和整页刷新。旧实现误拦截了 MainActivity.R3()；
+     * 该方法处理的是应用进程从后台回到前台后的超时逻辑，与底部页面切换无关。</p>
+     */
+    private void installHomeReturnRefreshHook(ClassLoader classLoader) {
         try {
-            Class<?> mainActivity = Class.forName(MAIN_ACTIVITY, false, classLoader);
-            Class<?> signInManager = Class.forName(
-                    "com.max.xiaoheihe.module.signin.SignInManager",
+            Class<?> receiverClass = Class.forName(
+                    "com.max.xiaoheihe.module.news.DiscoveryFragment$NewMsgBroadcastReceiver",
                     false, classLoader);
-            Method foreground = mainActivity.getMethod("R3");
-            Field backgroundAt = mainActivity.getDeclaredField("M");
-            Method getSignInManager = signInManager.getMethod("f");
-            Method syncSignIn = signInManager.getMethod("c");
-            backgroundAt.setAccessible(true);
-            hook(foreground).intercept(chain -> {
-                try {
-                    if (backgroundAt.getLong(chain.getThisObject()) > 0L) {
-                        Object manager = getSignInManager.invoke(null);
-                        if (manager != null) {
-                            syncSignIn.invoke(manager);
-                        }
-                    }
+            Method onReceive = receiverClass.getMethod(
+                    "onReceive", Context.class, Intent.class);
+            hook(onReceive).intercept(chain -> {
+                Intent intent = (Intent) chain.getArg(1);
+                if (intent != null && HOME_GO_TOP_ACTION.equals(intent.getAction())) {
                     return null;
-                } catch (Throwable throwable) {
-                    warn("FOREGROUND_REFRESH_FALLBACK reason="
-                            + unwrap(throwable).getClass().getSimpleName());
-                    return chain.proceed();
                 }
+                return chain.proceed();
             });
-            recordHookGroup("阻止前台刷新");
-            info("HOOK_FOREGROUND_REFRESH_OK method=MainActivity.R3");
+            recordHookGroup("阻止返回首页自动刷新");
+            info("HOOK_HOME_RETURN_REFRESH_OK receiver=DiscoveryFragment action="
+                    + HOME_GO_TOP_ACTION);
         } catch (Throwable throwable) {
-            error("HOOK_FOREGROUND_REFRESH_ERROR", throwable);
+            error("HOOK_HOME_RETURN_REFRESH_ERROR", throwable);
         }
     }
 
@@ -3133,7 +3132,7 @@ public final class HeyBoxModule extends XposedModule {
             enabled.add("媒体静止");
         }
         if (noForegroundRefreshSnapshot) {
-            enabled.add("禁止前台刷新");
+            enabled.add("禁止返回首页自动刷新");
         }
         if (imageEnhanceSnapshot) {
             enabled.add(imageWifiAdaptiveSnapshot

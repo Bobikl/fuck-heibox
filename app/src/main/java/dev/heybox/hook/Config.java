@@ -2,7 +2,7 @@ package dev.heybox.hook;
 
 /** 模块设置项；设置页与 Hook 共同读写小黑盒主进程中的宿主配置。 */
 public final class Config {
-    public static final String MODULE_VERSION = "0.7.0";
+    public static final String MODULE_VERSION = "0.7.1";
     public static final String MODULE_PACKAGE = "dev.heybox.hook";
     public static final String TARGET_PACKAGE = "com.max.xiaoheihe";
     public static final String PREFS_NAME = "heybox_hook";
