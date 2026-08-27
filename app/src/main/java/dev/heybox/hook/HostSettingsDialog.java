@@ -888,8 +888,21 @@ final class HostSettingsDialog extends Dialog {
     }
 
     private static boolean isPlausibleVersion(String value) {
-        return value != null && !value.isEmpty() && value.length() <= 64
-                && value.matches("[0-9A-Za-z._+\\-]+");
+        if (value == null || value.isEmpty() || value.length() > 64) {
+            return false;
+        }
+        for (int index = 0; index < value.length(); index++) {
+            char character = value.charAt(index);
+            boolean allowed = (character >= '0' && character <= '9')
+                    || (character >= 'A' && character <= 'Z')
+                    || (character >= 'a' && character <= 'z')
+                    || character == '.' || character == '_'
+                    || character == '+' || character == '-';
+            if (!allowed) {
+                return false;
+            }
+        }
+        return true;
     }
 
     private static boolean isPlausibleVersionCode(long value) {
