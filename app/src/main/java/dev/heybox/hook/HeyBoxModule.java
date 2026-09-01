@@ -126,7 +126,8 @@ public final class HeyBoxModule extends XposedModule {
     private volatile boolean adCleanMallBottomSnapshot;
     private volatile boolean disableClipboardTokenSnapshot;
     private volatile boolean externalBrowserSnapshot;
-    private volatile boolean disableMediaAutoplaySnapshot;
+    private volatile boolean disableVideoAutoplaySnapshot;
+    private volatile boolean disableGifAutoplaySnapshot;
     private volatile boolean noForegroundRefreshSnapshot;
     private volatile boolean imageEnhanceSnapshot;
     private volatile boolean imageWifiAdaptiveSnapshot;
@@ -152,6 +153,16 @@ public final class HeyBoxModule extends XposedModule {
             new WeakHashMap<>();
     private final Set<Object> requestedOriginalImages =
             Collections.newSetFromMap(new WeakHashMap<>());
+    /** 已由查看器普通图片加载器回调确认完成的图片。 */
+    private final Set<Object> loadedViewerImages =
+            Collections.newSetFromMap(new WeakHashMap<>());
+    /** 原图元数据先于普通图加载完成时，暂存当前页面的原图按钮。 */
+    private final Map<Object, WeakReference<TextView>> pendingOriginalButtons =
+            new WeakHashMap<>();
+    /** 防止翻页后误点被复用到另一张图片上的按钮。 */
+    private final Map<TextView, Object> originalButtonOwners = new WeakHashMap<>();
+    /** 只在 NewsTagListFragment.onHiddenChanged(false) 的同步调用栈内生效。 */
+    private final ThreadLocal<Boolean> suppressHomeVisibilityRefresh = new ThreadLocal<>();
     private volatile Resources centerNavigationResources;
     private volatile int[] centerNavigationIds;
     private String currentProcessName = "";
@@ -325,7 +336,7 @@ public final class HeyBoxModule extends XposedModule {
         if (externalBrowserSnapshot) {
             installExternalBrowserHooks(classLoader);
         }
-        if (disableMediaAutoplaySnapshot) {
+        if (disableVideoAutoplaySnapshot || disableGifAutoplaySnapshot) {
             installMediaAutoplayHooks(classLoader);
         }
         if (noForegroundRefreshSnapshot) {
@@ -2063,6 +2074,41 @@ public final class HeyBoxModule extends XposedModule {
 
     private void installMediaAutoplayHooks(ClassLoader classLoader) {
         int installed = 0;
+        if (disableVideoAutoplaySnapshot) {
+            installed += installRecommendedVideoAutoplayHooks(classLoader);
+        }
+        if (disableGifAutoplaySnapshot) {
+            installed += installFeedGifAutoplayHook(classLoader);
+        }
+
+        if (installed > 0) {
+            recordHookGroup("媒体防自动播放");
+            info("HOOK_MEDIA_AUTOPLAY_OK methods=" + installed);
+        } else {
+            warn("HOOK_MEDIA_AUTOPLAY_EMPTY");
+        }
+    }
+
+    /**
+     * 只截断推荐列表主动寻找可见卡片并播放的入口，播放器和点击播放逻辑保持原样。
+     * 相比在 AbsVideoView.play/start 热路径里判断调用来源，这种方式没有全局播放开销。
+     */
+    private int installRecommendedVideoAutoplayHooks(ClassLoader classLoader) {
+        int installed = 0;
+        try {
+            Class<?> fragment = Class.forName(
+                    "com.max.xiaoheihe.module.game.GameRecommendV2Fragment",
+                    false, classLoader);
+            Method autoPlayVisibleCard = fragment.getDeclaredMethod("j4");
+            autoPlayVisibleCard.setAccessible(true);
+            hook(autoPlayVisibleCard).intercept(chain -> null);
+            installed++;
+        } catch (Throwable throwable) {
+            warn("MEDIA_VIDEO_V2_HOOK_SKIP reason="
+                    + unwrap(throwable).getClass().getSimpleName());
+        }
+
+        // 深层兜底：V2 当前只有自动扫描传 false，播放按钮传 true。
         try {
             Class<?> videoView = Class.forName(
                     "com.max.xiaoheihe.module.game.component.GameVideoCardView",
@@ -2075,12 +2121,46 @@ public final class HeyBoxModule extends XposedModule {
             hook(play).intercept(chain -> Boolean.FALSE.equals(chain.getArg(1))
                     ? null : chain.proceed());
             installed++;
-            recordHookGroup("媒体/视频");
         } catch (Throwable throwable) {
-            warn("MEDIA_VIDEO_HOOK_SKIP reason="
+            warn("MEDIA_VIDEO_CARD_HOOK_SKIP reason="
                     + unwrap(throwable).getClass().getSimpleName());
         }
 
+        // 兼容旧推荐页：滚动后的自动播放在 t4()，首次绑定由适配器布尔标记触发。
+        try {
+            Class<?> legacyFragment = Class.forName(
+                    "com.max.xiaoheihe.module.game.GameMobileRecFragment",
+                    false, classLoader);
+            Method autoPlayAfterScroll = legacyFragment.getDeclaredMethod("t4", int.class);
+            autoPlayAfterScroll.setAccessible(true);
+            hook(autoPlayAfterScroll).intercept(chain -> null);
+
+            Class<?> legacyAdapter = Class.forName(
+                    "com.max.xiaoheihe.module.game.GameMobileRecFragment$f",
+                    false, classLoader);
+            Constructor<?> constructor = legacyAdapter.getDeclaredConstructor(legacyFragment);
+            Field firstAutoPlay = legacyAdapter.getDeclaredField("f84523b");
+            constructor.setAccessible(true);
+            firstAutoPlay.setAccessible(true);
+            hook(constructor).intercept(chain -> {
+                Object result = chain.proceed();
+                firstAutoPlay.setBoolean(chain.getThisObject(), false);
+                return result;
+            });
+            installed += 2;
+        } catch (Throwable throwable) {
+            warn("MEDIA_VIDEO_LEGACY_HOOK_SKIP reason="
+                    + unwrap(throwable).getClass().getSimpleName());
+        }
+
+        if (installed > 0) {
+            recordHookGroup("媒体/推荐视频");
+        }
+        return installed;
+    }
+
+    /** 列表加载器静止 GIF；全屏查看器使用另一套加载器，因此点开后仍会自动播放。 */
+    private int installFeedGifAutoplayHook(ClassLoader classLoader) {
         try {
             Class<?> imageLoader = Class.forName("com.max.hbimage.b", false, classLoader);
             Class<?> requestBuilder = Class.forName(
@@ -2112,39 +2192,12 @@ public final class HeyBoxModule extends XposedModule {
                 }
                 return chain.proceed(arguments);
             });
-            installed++;
-            recordHookGroup("媒体/GIF加载");
+            recordHookGroup("媒体/GIF列表");
+            return 1;
         } catch (Throwable throwable) {
             warn("MEDIA_GIF_HOOK_SKIP reason="
                     + unwrap(throwable).getClass().getSimpleName());
-        }
-
-        try {
-            Class<?> imageViewerBuilder = Class.forName(
-                    "com.max.xiaoheihe.utils.imageviewer.ImageViewerHelper$a",
-                    false, classLoader);
-            Method disableViewerGif = imageViewerBuilder.getMethod("a");
-            Method startViewer = imageViewerBuilder.getMethod("p");
-            hook(startViewer).intercept(chain -> {
-                try {
-                    disableViewerGif.invoke(chain.getThisObject());
-                } catch (Throwable throwable) {
-                    recordRuntimeFallback("图片查看器GIF静止", throwable);
-                }
-                return chain.proceed();
-            });
-            installed++;
-            recordHookGroup("媒体/查看器GIF");
-        } catch (Throwable throwable) {
-            warn("MEDIA_VIEWER_GIF_HOOK_SKIP reason="
-                    + unwrap(throwable).getClass().getSimpleName());
-        }
-
-        if (installed > 0) {
-            recordHookGroup("媒体防自动播放");
-            info("HOOK_MEDIA_AUTOPLAY_OK methods=" + installed);
-        } else {
-            warn("HOOK_MEDIA_AUTOPLAY_EMPTY");
+            return 0;
         }
     }
 
@@ -2169,14 +2222,14 @@ public final class HeyBoxModule extends XposedModule {
     }
 
     /**
-     * 阻止点击底部“首页”时发送的回顶刷新指令。
+     * 阻止返回首页后的自动刷新，同时保留手动下拉刷新。
      *
-     * <p>MainActivity 会在首页按钮的点击回调中广播
-     * {@code com.max.xiaoheihe.news.gotop}，DiscoveryFragment 收到后调用当前首页
-     * 子页面的 D3()，最终触发列表回顶和整页刷新。旧实现误拦截了 MainActivity.R3()；
-     * 该方法处理的是应用进程从后台回到前台后的超时逻辑，与底部页面切换无关。</p>
+     * <p>目标版本有两条独立路径：再次点击已选中的首页会发送 gotop 广播；从其他
+     * 底部页面返回时，NewsTagListFragment.onHiddenChanged(false) 会在离开超过
+     * 180 秒后同步调用 D3()。后者正是“待一段时间后回来才刷新”的实际来源。</p>
      */
     private void installHomeReturnRefreshHook(ClassLoader classLoader) {
+        int installed = 0;
         try {
             Class<?> receiverClass = Class.forName(
                     "com.max.xiaoheihe.module.news.DiscoveryFragment$NewMsgBroadcastReceiver",
@@ -2190,15 +2243,52 @@ public final class HeyBoxModule extends XposedModule {
                 }
                 return chain.proceed();
             });
-            recordHookGroup("阻止返回首页自动刷新");
-            info("HOOK_HOME_RETURN_REFRESH_OK receiver=DiscoveryFragment action="
-                    + HOME_GO_TOP_ACTION);
+            installed++;
         } catch (Throwable throwable) {
-            error("HOOK_HOME_RETURN_REFRESH_ERROR", throwable);
+            warn("HOME_GO_TOP_HOOK_SKIP reason="
+                    + unwrap(throwable).getClass().getSimpleName());
+        }
+
+        try {
+            Class<?> newsTagList = Class.forName(
+                    "com.max.xiaoheihe.module.news.NewsTagListFragment",
+                    false, classLoader);
+            Method visibilityChanged = newsTagList.getMethod(
+                    "onHiddenChanged", boolean.class);
+            Method autoRefresh = newsTagList.getMethod("D3");
+            hook(visibilityChanged).intercept(chain -> {
+                if (!Boolean.FALSE.equals(chain.getArg(0))) {
+                    return chain.proceed();
+                }
+                suppressHomeVisibilityRefresh.set(Boolean.TRUE);
+                try {
+                    return chain.proceed();
+                } finally {
+                    suppressHomeVisibilityRefresh.remove();
+                }
+            });
+            hook(autoRefresh).intercept(chain ->
+                    Boolean.TRUE.equals(suppressHomeVisibilityRefresh.get())
+                            ? null : chain.proceed());
+            installed += 2;
+        } catch (Throwable throwable) {
+            warn("HOME_STALE_VISIBILITY_HOOK_SKIP reason="
+                    + unwrap(throwable).getClass().getSimpleName());
+        }
+
+        if (installed > 0) {
+            recordHookGroup("阻止返回首页自动刷新");
+            info("HOOK_HOME_RETURN_REFRESH_OK methods=" + installed
+                    + " stale=NewsTagListFragment.onHiddenChanged");
+        } else {
+            warn("HOOK_HOME_RETURN_REFRESH_EMPTY");
         }
     }
 
-    /** 只在全屏图片查看器内自动点击一次“查看原图”，不改变信息流缩略图请求。 */
+    /**
+     * 只在全屏图片查看器的普通图片完成加载后点击一次“查看原图”。
+     * 不改变信息流缩略图请求，也不与查看器入场动画争抢网络和解码资源。
+     */
     private void installImageEnhancementHook(ClassLoader classLoader) {
         try {
             Class<?> customizer = Class.forName(
@@ -2210,46 +2300,119 @@ public final class HeyBoxModule extends XposedModule {
                     "K", mediaData, TextView.class);
             Method isOriginal = mediaData.getMethod("j");
             Method getOriginalUrl = mediaData.getMethod("g");
+            Method updateLoadedUrl = mediaData.getMethod("H", String.class);
+
+            // HBImageLoader 仅在 Glide 的 onResourceReady 回调中写入当前 URL；因此 H()
+            // 返回时可以视为普通图片已真正加载完成，而不是仅完成页面或按钮绑定。
+            hook(updateLoadedUrl).intercept(chain -> {
+                Object result = chain.proceed();
+                Object data = chain.getThisObject();
+                TextView pendingButton = null;
+                synchronized (requestedOriginalImages) {
+                    loadedViewerImages.add(data);
+                    WeakReference<TextView> reference = pendingOriginalButtons.remove(data);
+                    if (reference != null) {
+                        pendingButton = reference.get();
+                    }
+                }
+                if (pendingButton != null) {
+                    requestOriginalImage(data, pendingButton,
+                            isOriginal, getOriginalUrl);
+                }
+                return result;
+            });
+
             hook(updateOriginal).intercept(chain -> {
                 Object result = chain.proceed();
                 Object data = chain.getArg(0);
                 TextView originalButton = (TextView) chain.getArg(1);
-                boolean registered = false;
                 try {
-                    if (data != null && originalButton != null
-                            && Boolean.FALSE.equals(isOriginal.invoke(data))
-                            && !stringValue(getOriginalUrl.invoke(data)).isEmpty()
-                            && originalButton.hasOnClickListeners()) {
-                        if (imageWifiAdaptiveSnapshot
-                                && !hasUsableWifi(originalButton.getContext())) {
+                    if (data == null || originalButton == null) {
+                        return result;
+                    }
+                    boolean loaded;
+                    synchronized (requestedOriginalImages) {
+                        originalButtonOwners.put(originalButton, data);
+                        if (requestedOriginalImages.contains(data)) {
                             return result;
                         }
-                        synchronized (requestedOriginalImages) {
-                            if (!requestedOriginalImages.add(data)) {
-                                return result;
-                            }
-                            registered = true;
-                        }
-                        if (!originalButton.performClick()) {
-                            synchronized (requestedOriginalImages) {
-                                requestedOriginalImages.remove(data);
-                            }
+                        loaded = loadedViewerImages.contains(data);
+                        if (!loaded) {
+                            pendingOriginalButtons.put(
+                                    data, new WeakReference<>(originalButton));
                         }
                     }
+                    if (loaded) {
+                        requestOriginalImage(data, originalButton,
+                                isOriginal, getOriginalUrl);
+                    }
                 } catch (Throwable throwable) {
-                    if (registered) {
-                        synchronized (requestedOriginalImages) {
-                            requestedOriginalImages.remove(data);
-                        }
+                    synchronized (requestedOriginalImages) {
+                        pendingOriginalButtons.remove(data);
                     }
                     recordRuntimeFallback("自动加载原图", throwable);
                 }
                 return result;
             });
             recordHookGroup("图片增强");
-            info("HOOK_IMAGE_ENHANCE_OK method=BaseResUICustomizer.K");
+            info("HOOK_IMAGE_ENHANCE_OK method=MediaData.H->BaseResUICustomizer.K");
         } catch (Throwable throwable) {
             error("HOOK_IMAGE_ENHANCE_ERROR", throwable);
+        }
+    }
+
+    /**
+     * 该方法只会在普通图完成后或已完成图片的原图按钮晚到时调用。
+     * performClick 通过 View.post 排到当前加载回调和布局工作之后，避免同一帧重载。
+     */
+    private void requestOriginalImage(Object data, TextView originalButton,
+                                      Method isOriginal, Method getOriginalUrl) {
+        if (data == null || originalButton == null) {
+            return;
+        }
+        try {
+            if (Boolean.TRUE.equals(isOriginal.invoke(data))
+                    || stringValue(getOriginalUrl.invoke(data)).isEmpty()
+                    || !originalButton.hasOnClickListeners()) {
+                return;
+            }
+            if (imageWifiAdaptiveSnapshot
+                    && !hasUsableWifi(originalButton.getContext())) {
+                return;
+            }
+            synchronized (requestedOriginalImages) {
+                if (originalButtonOwners.get(originalButton) != data
+                        || !requestedOriginalImages.add(data)) {
+                    return;
+                }
+                pendingOriginalButtons.remove(data);
+            }
+            originalButton.post(() -> {
+                boolean keepRegistered = false;
+                try {
+                    synchronized (requestedOriginalImages) {
+                        if (originalButtonOwners.get(originalButton) != data) {
+                            requestedOriginalImages.remove(data);
+                            return;
+                        }
+                    }
+                    keepRegistered = originalButton.isAttachedToWindow()
+                            && originalButton.performClick();
+                } catch (Throwable throwable) {
+                    recordRuntimeFallback("自动加载原图", throwable);
+                } finally {
+                    if (!keepRegistered) {
+                        synchronized (requestedOriginalImages) {
+                            requestedOriginalImages.remove(data);
+                        }
+                    }
+                }
+            });
+        } catch (Throwable throwable) {
+            synchronized (requestedOriginalImages) {
+                requestedOriginalImages.remove(data);
+            }
+            recordRuntimeFallback("自动加载原图", throwable);
         }
     }
 
@@ -2535,11 +2698,14 @@ public final class HeyBoxModule extends XposedModule {
             expected.add("外部浏览器/k0");
             expected.add("外部浏览器/l0");
         }
-        if (disableMediaAutoplaySnapshot) {
+        if (disableVideoAutoplaySnapshot || disableGifAutoplaySnapshot) {
             expected.add("媒体防自动播放");
-            expected.add("媒体/视频");
-            expected.add("媒体/GIF加载");
-            expected.add("媒体/查看器GIF");
+        }
+        if (disableVideoAutoplaySnapshot) {
+            expected.add("媒体/推荐视频");
+        }
+        if (disableGifAutoplaySnapshot) {
+            expected.add("媒体/GIF列表");
         }
         if (noForegroundRefreshSnapshot) {
             expected.add("阻止返回首页自动刷新");
@@ -3321,8 +3487,18 @@ public final class HeyBoxModule extends XposedModule {
         disableClipboardTokenSnapshot = isEnabled(
                 Config.KEY_DISABLE_CLIPBOARD_TOKEN, false);
         externalBrowserSnapshot = isEnabled(Config.KEY_EXTERNAL_BROWSER, false);
-        disableMediaAutoplaySnapshot = isEnabled(
+        // 0.7.3 及更早版本只有一个媒体开关。设置页会一次性迁移；在用户尚未
+        // 打开设置页时也读取旧值，避免升级后的第一次宿主启动出现配置失效。
+        boolean legacyMediaAutoplay = isEnabled(
                 Config.KEY_DISABLE_MEDIA_AUTOPLAY, false);
+        disableVideoAutoplaySnapshot = preferences.contains(
+                Config.KEY_DISABLE_VIDEO_AUTOPLAY)
+                ? isEnabled(Config.KEY_DISABLE_VIDEO_AUTOPLAY, false)
+                : legacyMediaAutoplay;
+        disableGifAutoplaySnapshot = preferences.contains(
+                Config.KEY_DISABLE_GIF_AUTOPLAY)
+                ? isEnabled(Config.KEY_DISABLE_GIF_AUTOPLAY, false)
+                : legacyMediaAutoplay;
         noForegroundRefreshSnapshot = isEnabled(
                 Config.KEY_NO_FOREGROUND_REFRESH, false);
         imageEnhanceSnapshot = isEnabled(Config.KEY_IMAGE_ENHANCE, false);
@@ -3352,7 +3528,8 @@ public final class HeyBoxModule extends XposedModule {
                 + ",mall_bottom=" + adCleanMallBottomSnapshot + "]"
                 + " clipboard=" + disableClipboardTokenSnapshot
                 + " external_browser=" + externalBrowserSnapshot
-                + " media_autoplay=" + disableMediaAutoplaySnapshot
+                + " video_autoplay=" + disableVideoAutoplaySnapshot
+                + " gif_autoplay=" + disableGifAutoplaySnapshot
                 + " no_foreground_refresh=" + noForegroundRefreshSnapshot
                 + " image_enhance=" + imageEnhanceSnapshot
                 + " image_wifi=" + imageWifiAdaptiveSnapshot
@@ -3772,8 +3949,11 @@ public final class HeyBoxModule extends XposedModule {
         if (externalBrowserSnapshot) {
             enabled.add("外部浏览器");
         }
-        if (disableMediaAutoplaySnapshot) {
-            enabled.add("媒体静止");
+        if (disableVideoAutoplaySnapshot) {
+            enabled.add("推荐视频不自动播放");
+        }
+        if (disableGifAutoplaySnapshot) {
+            enabled.add("信息流GIF静止");
         }
         if (noForegroundRefreshSnapshot) {
             enabled.add("禁止返回首页自动刷新");

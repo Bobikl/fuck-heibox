@@ -26,7 +26,10 @@ public final class Config {
     public static final String KEY_AD_CLEAN_MALL_BOTTOM = "ad_clean_mall_bottom";
     public static final String KEY_DISABLE_CLIPBOARD_TOKEN = "disable_clipboard_token";
     public static final String KEY_EXTERNAL_BROWSER = "external_browser";
+    /** 0.7.3 及更早版本的视频/GIF合并开关，仅用于一次性兼容迁移。 */
     public static final String KEY_DISABLE_MEDIA_AUTOPLAY = "disable_media_autoplay";
+    public static final String KEY_DISABLE_VIDEO_AUTOPLAY = "disable_video_autoplay";
+    public static final String KEY_DISABLE_GIF_AUTOPLAY = "disable_gif_autoplay";
     public static final String KEY_NO_FOREGROUND_REFRESH = "no_foreground_refresh";
     public static final String KEY_IMAGE_ENHANCE = "image_enhance";
     public static final String KEY_IMAGE_WIFI_ADAPTIVE = "image_wifi_adaptive";

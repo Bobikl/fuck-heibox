@@ -90,7 +90,27 @@ final class HostSettingsDialog extends Dialog {
         this.host = host;
         this.preferences = preferences;
         this.runtimeBridge = runtimeBridge;
+        migrateMediaAutoplayPreference();
         setOwnerActivity(host);
+    }
+
+    /**
+     * 旧版本把视频与 GIF 放在同一个开关中。只在两个新键都不存在时复制一次旧值，
+     * 此后用户可以分别控制，旧键不会再参与运行时判断。
+     */
+    private void migrateMediaAutoplayPreference() {
+        if (!preferences.contains(Config.KEY_DISABLE_MEDIA_AUTOPLAY)
+                || preferences.contains(Config.KEY_DISABLE_VIDEO_AUTOPLAY)
+                || preferences.contains(Config.KEY_DISABLE_GIF_AUTOPLAY)) {
+            return;
+        }
+        boolean oldValue = preferences.getBoolean(
+                Config.KEY_DISABLE_MEDIA_AUTOPLAY, false);
+        preferences.edit()
+                .putBoolean(Config.KEY_DISABLE_VIDEO_AUTOPLAY, oldValue)
+                .putBoolean(Config.KEY_DISABLE_GIF_AUTOPLAY, oldValue)
+                .remove(Config.KEY_DISABLE_MEDIA_AUTOPLAY)
+                .apply();
     }
 
     @Override
@@ -229,8 +249,12 @@ final class HostSettingsDialog extends Dialog {
                 Config.KEY_POST_TEXT_SELECT, false));
         experienceCard.addView(createDivider());
         experienceCard.addView(createSwitchRow(
-                "禁止视频/GIF 自动播放", "视频保留手动播放；GIF 默认显示静态首帧",
-                Config.KEY_DISABLE_MEDIA_AUTOPLAY, false));
+                "禁止推荐视频自动播放", "游戏推荐列表中的视频保留手动播放",
+                Config.KEY_DISABLE_VIDEO_AUTOPLAY, false));
+        experienceCard.addView(createDivider());
+        experienceCard.addView(createSwitchRow(
+                "禁止信息流 GIF 自动播放", "列表中显示静态首帧；点开后自动播放",
+                Config.KEY_DISABLE_GIF_AUTOPLAY, false));
         experienceCard.addView(createDivider());
         experienceCard.addView(createSwitchRow(
                 "返回首页不自动刷新", "从其他底部页面返回首页时保留当前位置；手动下拉刷新不受影响",
