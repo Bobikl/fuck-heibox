@@ -65,23 +65,22 @@ final class HostSettingsDialog extends Dialog {
         setOwnerActivity(host);
     }
 
-    /**
-     * 旧版本把视频与 GIF 放在同一个开关中。只在两个新键都不存在时复制一次旧值，
-     * 此后用户可以分别控制，旧键不会再参与运行时判断。
-     */
+    /** 旧版合并开关逐字段迁移；不能因其中一个新键已存在而漏掉另一个。 */
     private void migrateMediaAutoplayPreference() {
-        if (!preferences.contains(Config.KEY_DISABLE_MEDIA_AUTOPLAY)
-                || preferences.contains(Config.KEY_DISABLE_VIDEO_AUTOPLAY)
-                || preferences.contains(Config.KEY_DISABLE_GIF_AUTOPLAY)) {
+        if (!preferences.contains(Config.KEY_DISABLE_MEDIA_AUTOPLAY)) {
             return;
         }
         boolean oldValue = preferences.getBoolean(
                 Config.KEY_DISABLE_MEDIA_AUTOPLAY, false);
-        preferences.edit()
-                .putBoolean(Config.KEY_DISABLE_VIDEO_AUTOPLAY, oldValue)
-                .putBoolean(Config.KEY_DISABLE_GIF_AUTOPLAY, oldValue)
-                .remove(Config.KEY_DISABLE_MEDIA_AUTOPLAY)
-                .apply();
+        SharedPreferences.Editor editor = preferences.edit();
+        if (!preferences.contains(Config.KEY_DISABLE_VIDEO_AUTOPLAY)) {
+            editor.putBoolean(Config.KEY_DISABLE_VIDEO_AUTOPLAY, oldValue);
+        }
+        if (!preferences.contains(Config.KEY_DISABLE_GIF_AUTOPLAY)) {
+            editor.putBoolean(Config.KEY_DISABLE_GIF_AUTOPLAY, oldValue);
+        }
+        // 执行到这里后两个新键都已经存在或将在本次事务中写入。
+        editor.remove(Config.KEY_DISABLE_MEDIA_AUTOPLAY).apply();
     }
 
     @Override

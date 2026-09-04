@@ -18,6 +18,7 @@ import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
+import android.os.SystemClock;
 import android.util.Log;
 import android.view.View;
 import android.view.ViewGroup;
@@ -95,6 +96,8 @@ public final class HeyBoxModule extends XposedModule {
     private static final long DAILY_SHARE_START_DELAY_MS = 3500L;
     private static final long DAILY_SHARE_RETRY_DELAY_MS = 5000L;
     private static final int DAILY_SHARE_MAX_FETCH_ATTEMPTS = 2;
+    private static final long DAILY_SHARE_INITIAL_COOLDOWN_MS = 10L * 60L * 1000L;
+    private static final long DAILY_SHARE_MAX_COOLDOWN_MS = 30L * 60L * 1000L;
     private static final long DAILY_SHARE_FETCH_TIMEOUT_MS = 20000L;
     private static final long DAILY_SHARE_CONFIRM_DELAY_MS = 3000L;
     private static final int DAILY_SHARE_CONFIRM_MAX_ATTEMPTS = 2;
@@ -159,8 +162,15 @@ public final class HeyBoxModule extends XposedModule {
     private long dailyShareRequestGeneration;
     private int dailyShareActiveAttempt;
     private volatile TaskRequestHandle dailyShareActiveRequest;
-    private String dailyShareSuppressedDay = "";
-    private String dailyShareSuppressedAccount = "";
+    private DailyShareContext dailyShareActiveContext;
+    /** 明确的宿主结构不兼容只在当前进程、当前日期和账号内停止自动重试。 */
+    private String dailyShareIncompatibleDay = "";
+    private String dailyShareIncompatibleAccount = "";
+    /** 临时网络失败使用单调时间冷却；日期或账号变化时不会继承。 */
+    private String dailyShareCooldownDay = "";
+    private String dailyShareCooldownAccount = "";
+    private long dailyShareRetryAfterElapsed;
+    private int dailyShareTransientFailureRounds;
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
     private final Map<Object, Runnable> pendingTaskRefreshes = new WeakHashMap<>();
     private final Map<Activity, List<WeakReference<View>>> centerNavigationViews =
@@ -181,7 +191,9 @@ public final class HeyBoxModule extends XposedModule {
     private String currentProcessName = "";
     private final Set<String> installedHookGroups = new LinkedHashSet<>();
     private final Map<String, HookGroupProgress> hookGroupProgress = new LinkedHashMap<>();
-    private final Set<String> runtimeHookFailures = new LinkedHashSet<>();
+    private final Map<String, RuntimeHookState> runtimeHookStates = new LinkedHashMap<>();
+    /** Copy-on-write 活动故障名；正常热路径只做无锁空 Set 查询。 */
+    private volatile Set<String> activeRuntimeHookNames = Collections.emptySet();
 
     @Override
     public void onModuleLoaded(ModuleLoadedParam param) {
@@ -528,14 +540,16 @@ public final class HeyBoxModule extends XposedModule {
                         || cachedViews.size() != ids.length;
                 if (!resolveViews) {
                     for (int index = 0; index < cachedViews.size(); index++) {
-                        // null 条目表示该资源在当前布局中不存在；它不是失效缓存，
-                        // 不能因此在每次 onResume 都重新遍历整棵 View 树。
+                        // 只有资源 ID 为 0 才能永久负缓存；非零 ID 的 null 条目
+                        // 可能只是 View 尚未 inflate，下一次 onResume 必须重试。
                         if (ids[index] == 0) {
                             continue;
                         }
                         WeakReference<View> reference = cachedViews.get(index);
                         if (reference == null) {
-                            continue;
+                            // 资源存在但当前布局尚未 inflate，不能永久当作不存在。
+                            resolveViews = true;
+                            break;
                         }
                         View cached = reference.get();
                         if (cached == null || !cached.isAttachedToWindow()) {
@@ -574,6 +588,7 @@ public final class HeyBoxModule extends XposedModule {
                         + " found=" + found
                         + " changed=" + changed);
             }
+            recordRuntimeSuccess("隐藏发布按钮/" + source);
         } catch (Throwable throwable) {
             recordRuntimeFallback("隐藏发布按钮/" + source, throwable);
         }
@@ -585,6 +600,7 @@ public final class HeyBoxModule extends XposedModule {
             Class<?> shareDataClass = Class.forName(SHARE_DATA, false, classLoader);
             Method shareEntry = shareUtilClass.getDeclaredMethod(
                     "E", android.content.Context.class, shareDataClass);
+            requireVoidReturn(shareEntry);
             Method getShareListener = shareDataClass.getMethod("getShareListener");
             Method getReportExtra = shareDataClass.getMethod("getReport_extra");
             Method getTitle = shareDataClass.getMethod("getTitle");
@@ -612,6 +628,7 @@ public final class HeyBoxModule extends XposedModule {
                             + " src=" + source
                             + " media=" + media
                             + " report_extra=" + stringValue(reportExtra));
+                    recordRuntimeSuccess("分享任务入口");
                     // 原方法返回 void。这里不继续执行，从而不显示真实分享面板。
                     return null;
                 } catch (Throwable throwable) {
@@ -663,6 +680,7 @@ public final class HeyBoxModule extends XposedModule {
                     return result;
                 }
 
+                boolean bindingFailed = false;
                 try {
                     String title = stringValue(getTitle.invoke(task));
                     String type = stringValue(getType.invoke(task));
@@ -736,7 +754,12 @@ public final class HeyBoxModule extends XposedModule {
                         }
                     });
                 } catch (Throwable throwable) {
+                    bindingFailed = true;
                     recordRuntimeFallback("分享任务按钮绑定", throwable);
+                } finally {
+                    if (!bindingFailed) {
+                        recordRuntimeSuccess("分享任务按钮绑定");
+                    }
                 }
                 return result;
             });
@@ -777,7 +800,8 @@ public final class HeyBoxModule extends XposedModule {
             consume.setAccessible(true);
             hook(consume).intercept(chain -> {
                 Object result = chain.proceed();
-                scheduleDailyShareTasks(chain.getArg(0), chain.getArg(1), classLoader);
+                scheduleObservedDailyShareTasks(
+                        chain.getArg(0), chain.getArg(1), classLoader);
                 return result;
             });
             recordHookGroup("每日分享任务");
@@ -800,10 +824,19 @@ public final class HeyBoxModule extends XposedModule {
             return;
         }
         String accountKey = resolveDailyAccountKey();
+        String day = currentDay();
+        DailyShareContext previousContext;
+        synchronized (this) {
+            previousContext = dailyShareActiveContext;
+        }
+        if (previousContext != null && (!day.equals(previousContext.day)
+                || !accountKey.equals(previousContext.accountKey))) {
+            // 首页恢复时主动终止旧日期/旧账号流程，不必等待旧网络回调或超时。
+            expireDailyShareContext(previousContext, classLoader);
+        }
         if (accountKey.isEmpty()) {
             return;
         }
-        String day = currentDay();
         DailyShareRuntimeState runtimeState = readDailyShareState(
                 context, accountKey);
         if (day.equals(runtimeState.day)
@@ -815,34 +848,51 @@ public final class HeyBoxModule extends XposedModule {
             info("DAILY_TASK_RECOVERY_SCHEDULED day=" + day
                     + " previous_tasks=" + runtimeState.taskKeys.size());
         }
-        final long generation;
+        final DailyShareContext runContext;
         synchronized (this) {
-            if (day.equals(dailyShareSuppressedDay)
-                    && accountKey.equals(dailyShareSuppressedAccount)) {
+            resetDailyShareFailureGateIfContextChangedLocked(day, accountKey);
+            if (day.equals(dailyShareIncompatibleDay)
+                    && accountKey.equals(dailyShareIncompatibleAccount)) {
                 return;
+            }
+            if (day.equals(dailyShareCooldownDay)
+                    && accountKey.equals(dailyShareCooldownAccount)
+                    && SystemClock.elapsedRealtime() < dailyShareRetryAfterElapsed) {
+                return;
+            }
+            if (day.equals(dailyShareCooldownDay)
+                    && accountKey.equals(dailyShareCooldownAccount)) {
+                dailyShareRetryAfterElapsed = 0L;
             }
             if (dailyShareFetchRequested || dailyShareInProgress) {
                 return;
             }
             dailyShareFetchRequested = true;
             dailyShareActiveAttempt = 1;
-            generation = ++dailyShareRequestGeneration;
+            runContext = new DailyShareContext(
+                    day, accountKey, ++dailyShareRequestGeneration);
+            dailyShareActiveContext = runContext;
         }
         mainHandler.postDelayed(
-                () -> requestDailyShareList(
-                        classLoader, day, accountKey, 1, generation),
+                () -> {
+                    if (isDailyShareContextValid(runContext)) {
+                        requestDailyShareList(classLoader, runContext, 1);
+                    } else {
+                        expireDailyShareContext(runContext, classLoader);
+                    }
+                },
                 DAILY_SHARE_START_DELAY_MS);
         info("DAILY_TASK_FETCH_SCHEDULED day=" + day
                 + " delay_ms=" + DAILY_SHARE_START_DELAY_MS);
     }
 
-    private void requestDailyShareList(ClassLoader classLoader, String day,
-                                       String accountKey, int attempt, long generation) {
-        if (!isDailyShareRequestActive(generation, attempt)) {
+    private void requestDailyShareList(ClassLoader classLoader,
+                                       DailyShareContext runContext, int attempt) {
+        if (!isDailyShareRequestActive(runContext, attempt)) {
             return;
         }
-        if (!day.equals(currentDay()) || !accountKey.equals(resolveDailyAccountKey())) {
-            invalidateDailyShareRequest();
+        if (!isDailyShareContextValid(runContext)) {
+            expireDailyShareContext(runContext, classLoader);
             return;
         }
         AtomicBoolean responseReceived = new AtomicBoolean();
@@ -852,48 +902,68 @@ public final class HeyBoxModule extends XposedModule {
                 @Override
                 public void onResult(Object taskResult) {
                     responseReceived.set(true);
-                    if (!isDailyShareRequestActive(generation, attempt)) {
+                    if (!isDailyShareRequestActive(runContext, attempt)) {
                         return;
                     }
-                    if (!accountKey.equals(resolveDailyAccountKey())) {
-                        invalidateDailyShareRequest();
+                    if (!isDailyShareContextValid(runContext)) {
+                        expireDailyShareContext(runContext, classLoader);
                         return;
                     }
-                    boolean handled = scheduleDailyShareTasks(
-                            null, taskResult, classLoader);
-                    if (!handled) {
-                        scheduleDailyShareRetry(classLoader, day, accountKey,
-                                attempt, generation, "invalid_or_unhandled_result");
+                    DailyShareScheduleResult result = scheduleDailyShareTasks(
+                            null, taskResult, classLoader, runContext);
+                    if (result == DailyShareScheduleResult.TRANSIENT_FAILURE) {
+                        scheduleDailyShareRetry(classLoader, runContext, attempt,
+                                DailyShareFailureKind.TRANSIENT,
+                                "invalid_or_unhandled_result");
+                    } else if (result == DailyShareScheduleResult.INCOMPATIBLE) {
+                        scheduleDailyShareRetry(classLoader, runContext, attempt,
+                                DailyShareFailureKind.INCOMPATIBLE,
+                                "task_structure_incompatible");
+                    } else if (result == DailyShareScheduleResult.CONTEXT_EXPIRED) {
+                        expireDailyShareContext(runContext, classLoader);
                     }
                 }
 
                 @Override
                 public void onFailure(String reason) {
                     responseReceived.set(true);
-                    if (isDailyShareRequestActive(generation, attempt)) {
-                        scheduleDailyShareRetry(classLoader, day, accountKey,
-                                attempt, generation, reason);
+                    if (!isDailyShareRequestActive(runContext, attempt)) {
+                        return;
                     }
+                    if (!isDailyShareContextValid(runContext)) {
+                        expireDailyShareContext(runContext, classLoader);
+                        return;
+                    }
+                    scheduleDailyShareRetry(classLoader, runContext, attempt,
+                            DailyShareFailureKind.TRANSIENT, reason);
                 }
             });
             requestHolder.set(request);
-            replaceDailyShareActiveRequest(request, generation, attempt);
+            replaceDailyShareActiveRequest(request, runContext, attempt);
             mainHandler.postDelayed(() -> {
                 if (!responseReceived.get()
-                        && isDailyShareRequestActive(generation, attempt)) {
+                        && isDailyShareRequestActive(runContext, attempt)) {
+                    if (!isDailyShareContextValid(runContext)) {
+                        expireDailyShareContext(runContext, classLoader);
+                        return;
+                    }
                     TaskRequestHandle active = requestHolder.get();
                     if (active != null) {
                         active.cancel();
                     }
-                    scheduleDailyShareRetry(classLoader, day, accountKey,
-                            attempt, generation, "timeout");
+                    scheduleDailyShareRetry(classLoader, runContext, attempt,
+                            DailyShareFailureKind.TRANSIENT, "timeout");
                 }
             }, DAILY_SHARE_FETCH_TIMEOUT_MS);
             info("DAILY_TASK_FETCH_REQUEST_OK endpoint=/task/list_v2/ attempt=" + attempt);
         } catch (Throwable throwable) {
-            scheduleDailyShareRetry(classLoader, day, accountKey,
-                    attempt, generation,
-                    unwrap(throwable).getClass().getSimpleName());
+            if (isDailyShareContextValid(runContext)) {
+                scheduleDailyShareRetry(classLoader, runContext, attempt,
+                        DailyShareFailureKind.TRANSIENT,
+                        unwrap(throwable).getClass().getSimpleName());
+            } else {
+                expireDailyShareContext(runContext, classLoader);
+            }
             error("DAILY_TASK_FETCH_REQUEST_ERROR attempt=" + attempt, unwrap(throwable));
         }
     }
@@ -979,14 +1049,19 @@ public final class HeyBoxModule extends XposedModule {
         }
     }
 
-    private void scheduleDailyShareRetry(ClassLoader classLoader, String day,
-                                          String accountKey, int attempt,
-                                          long generation, String reason) {
+    private void scheduleDailyShareRetry(ClassLoader classLoader,
+                                         DailyShareContext runContext, int attempt,
+                                         DailyShareFailureKind failureKind,
+                                         String reason) {
+        if (!isDailyShareContextValid(runContext)) {
+            expireDailyShareContext(runContext, classLoader);
+            return;
+        }
         TaskRequestHandle request;
         boolean giveUp;
+        long cooldownMs = 0L;
         synchronized (this) {
-            if (!dailyShareFetchRequested
-                    || dailyShareRequestGeneration != generation
+            if (!isDailyShareRequestActiveLocked(runContext, attempt)
                     || dailyShareActiveAttempt != attempt) {
                 return;
             }
@@ -996,9 +1071,25 @@ public final class HeyBoxModule extends XposedModule {
             if (giveUp) {
                 dailyShareFetchRequested = false;
                 dailyShareActiveAttempt = 0;
+                dailyShareInProgress = false;
+                dailyShareActiveContext = null;
                 dailyShareRequestGeneration++;
-                dailyShareSuppressedDay = day;
-                dailyShareSuppressedAccount = accountKey;
+                if (failureKind == DailyShareFailureKind.INCOMPATIBLE) {
+                    dailyShareIncompatibleDay = runContext.day;
+                    dailyShareIncompatibleAccount = runContext.accountKey;
+                    dailyShareRetryAfterElapsed = 0L;
+                } else {
+                    resetDailyShareFailureGateIfContextChangedLocked(
+                            runContext.day, runContext.accountKey);
+                    dailyShareCooldownDay = runContext.day;
+                    dailyShareCooldownAccount = runContext.accountKey;
+                    dailyShareTransientFailureRounds++;
+                    cooldownMs = dailyShareTransientFailureRounds <= 1
+                            ? DAILY_SHARE_INITIAL_COOLDOWN_MS
+                            : DAILY_SHARE_MAX_COOLDOWN_MS;
+                    dailyShareRetryAfterElapsed = SystemClock.elapsedRealtime()
+                            + cooldownMs;
+                }
             } else {
                 dailyShareActiveAttempt = attempt + 1;
             }
@@ -1007,41 +1098,94 @@ public final class HeyBoxModule extends XposedModule {
             request.cancel();
         }
         if (giveUp) {
-            warn("DAILY_TASK_FETCH_GIVE_UP day=" + day + " reason=" + reason);
+            if (failureKind == DailyShareFailureKind.INCOMPATIBLE) {
+                recordRuntimeFailure("每日任务结构", "IncompatibleStructure");
+            }
+            warn("DAILY_TASK_FETCH_GIVE_UP day=" + runContext.day
+                    + " kind=" + failureKind
+                    + " cooldown_ms=" + cooldownMs
+                    + " reason=" + reason);
             return;
         }
         warn("DAILY_TASK_FETCH_ERROR attempt=" + attempt + " reason=" + reason);
         mainHandler.postDelayed(
-                () -> requestDailyShareList(classLoader, day, accountKey,
-                        attempt + 1, generation),
+                () -> {
+                    if (isDailyShareContextValid(runContext)) {
+                        requestDailyShareList(classLoader, runContext, attempt + 1);
+                    } else {
+                        expireDailyShareContext(runContext, classLoader);
+                    }
+                },
                 DAILY_SHARE_RETRY_DELAY_MS);
     }
 
-    private synchronized boolean isDailyShareRequestActive(long generation, int attempt) {
-        return dailyShareFetchRequested
-                && dailyShareRequestGeneration == generation
+    private synchronized boolean isDailyShareRequestActive(
+            DailyShareContext runContext, int attempt) {
+        return isDailyShareRequestActiveLocked(runContext, attempt);
+    }
+
+    private boolean isDailyShareRequestActiveLocked(
+            DailyShareContext runContext, int attempt) {
+        return runContext != null
+                && dailyShareFetchRequested
+                && dailyShareActiveContext != null
+                && dailyShareActiveContext.generation == runContext.generation
+                && dailyShareRequestGeneration == runContext.generation
                 && dailyShareActiveAttempt == attempt;
     }
 
-    private void invalidateDailyShareRequest() {
+    private boolean isDailyShareContextValid(DailyShareContext runContext) {
+        if (runContext == null
+                || !runContext.day.equals(currentDay())
+                || !runContext.accountKey.equals(resolveDailyAccountKey())) {
+            return false;
+        }
+        synchronized (this) {
+            return dailyShareActiveContext != null
+                    && dailyShareActiveContext.generation == runContext.generation
+                    && dailyShareRequestGeneration == runContext.generation;
+        }
+    }
+
+    /** 只关闭匹配的旧流程；晚到的旧回调不能误伤已经启动的新 generation。 */
+    private void expireDailyShareContext(DailyShareContext runContext,
+                                         ClassLoader classLoader) {
+        boolean invalidated = closeDailyShareContext(runContext);
+        if (invalidated) {
+            info("DAILY_TASK_CONTEXT_EXPIRED day=" + runContext.day
+                    + " account=" + runContext.accountKey);
+            mainHandler.post(() -> triggerDailyShareFetch(classLoader));
+        }
+    }
+
+    private boolean closeDailyShareContext(DailyShareContext runContext) {
         TaskRequestHandle request;
         synchronized (this) {
+            if (runContext == null || dailyShareActiveContext == null
+                    || dailyShareActiveContext.generation != runContext.generation
+                    || dailyShareRequestGeneration != runContext.generation) {
+                return false;
+            }
             request = dailyShareActiveRequest;
             dailyShareActiveRequest = null;
             dailyShareFetchRequested = false;
+            dailyShareInProgress = false;
             dailyShareActiveAttempt = 0;
+            dailyShareActiveContext = null;
             dailyShareRequestGeneration++;
         }
         if (request != null) {
             request.cancel();
         }
+        return true;
     }
 
     private void replaceDailyShareActiveRequest(TaskRequestHandle request,
-                                                long generation, int attempt) {
+                                                DailyShareContext runContext,
+                                                int attempt) {
         TaskRequestHandle previous;
         synchronized (this) {
-            if (!isDailyShareRequestActive(generation, attempt)) {
+            if (!isDailyShareRequestActiveLocked(runContext, attempt)) {
                 request.cancel();
                 return;
             }
@@ -1053,97 +1197,259 @@ public final class HeyBoxModule extends XposedModule {
         }
     }
 
-    private boolean scheduleDailyShareTasks(Object fragment, Object taskResult,
-                                            ClassLoader classLoader) {
+    private void resetDailyShareFailureGateIfContextChangedLocked(
+            String day, String accountKey) {
+        if (!day.equals(dailyShareCooldownDay)
+                || !accountKey.equals(dailyShareCooldownAccount)) {
+            dailyShareCooldownDay = day;
+            dailyShareCooldownAccount = accountKey;
+            dailyShareRetryAfterElapsed = 0L;
+            dailyShareTransientFailureRounds = 0;
+        }
+        if (!day.equals(dailyShareIncompatibleDay)
+                || !accountKey.equals(dailyShareIncompatibleAccount)) {
+            dailyShareIncompatibleDay = "";
+            dailyShareIncompatibleAccount = "";
+        }
+    }
+
+    private void clearDailyShareFailureGate(DailyShareContext runContext) {
+        synchronized (this) {
+            if (runContext == null || dailyShareActiveContext == null
+                    || dailyShareActiveContext.generation != runContext.generation) {
+                return;
+            }
+            dailyShareCooldownDay = runContext.day;
+            dailyShareCooldownAccount = runContext.accountKey;
+            dailyShareRetryAfterElapsed = 0L;
+            dailyShareTransientFailureRounds = 0;
+            dailyShareIncompatibleDay = "";
+            dailyShareIncompatibleAccount = "";
+        }
+    }
+
+    /** 复用用户主动打开任务页已经取得的响应，不额外发起网络请求。 */
+    private void scheduleObservedDailyShareTasks(Object fragment, Object taskResult,
+                                                 ClassLoader classLoader) {
+        Context androidContext = fragment == null
+                ? targetContext : getFragmentContext(fragment);
+        if (androidContext == null) {
+            return;
+        }
+        String day = currentDay();
+        String accountKey = resolveDailyAccountKey();
+        if (accountKey.isEmpty()) {
+            return;
+        }
+        DailyShareRuntimeState state = readDailyShareState(androidContext, accountKey);
+        if (day.equals(state.day)
+                && DAILY_SHARE_STATE_CONFIRMED.equals(state.state)) {
+            return;
+        }
+
+        DailyShareContext existing;
+        synchronized (this) {
+            existing = dailyShareActiveContext;
+        }
+        if (existing != null && (!day.equals(existing.day)
+                || !accountKey.equals(existing.accountKey))) {
+            expireDailyShareContext(existing, classLoader);
+        }
+
+        final DailyShareContext runContext;
+        final int attempt;
+        final boolean retryBlockedByGate;
+        synchronized (this) {
+            if (dailyShareInProgress) {
+                return;
+            }
+            if (dailyShareActiveContext != null
+                    && day.equals(dailyShareActiveContext.day)
+                    && accountKey.equals(dailyShareActiveContext.accountKey)) {
+                runContext = dailyShareActiveContext;
+                attempt = Math.max(1, dailyShareActiveAttempt);
+                retryBlockedByGate = false;
+            } else {
+                resetDailyShareFailureGateIfContextChangedLocked(day, accountKey);
+                retryBlockedByGate = (day.equals(dailyShareIncompatibleDay)
+                        && accountKey.equals(dailyShareIncompatibleAccount))
+                        || (day.equals(dailyShareCooldownDay)
+                        && accountKey.equals(dailyShareCooldownAccount)
+                        && SystemClock.elapsedRealtime() < dailyShareRetryAfterElapsed);
+                runContext = new DailyShareContext(
+                        day, accountKey, ++dailyShareRequestGeneration);
+                dailyShareActiveContext = runContext;
+                dailyShareFetchRequested = true;
+                dailyShareActiveAttempt = 1;
+                attempt = 1;
+            }
+        }
+
+        DailyShareScheduleResult result = scheduleDailyShareTasks(
+                fragment, taskResult, classLoader, runContext);
+        if (result == DailyShareScheduleResult.TRANSIENT_FAILURE) {
+            if (retryBlockedByGate) {
+                closeDailyShareContext(runContext);
+            } else {
+                scheduleDailyShareRetry(classLoader, runContext, attempt,
+                        DailyShareFailureKind.TRANSIENT, "observed_result_invalid");
+            }
+        } else if (result == DailyShareScheduleResult.INCOMPATIBLE) {
+            if (retryBlockedByGate) {
+                closeDailyShareContext(runContext);
+            } else {
+                scheduleDailyShareRetry(classLoader, runContext, attempt,
+                        DailyShareFailureKind.INCOMPATIBLE,
+                        "observed_structure_incompatible");
+            }
+        } else if (result == DailyShareScheduleResult.CONTEXT_EXPIRED) {
+            expireDailyShareContext(runContext, classLoader);
+        }
+    }
+
+    private DailyShareScheduleResult scheduleDailyShareTasks(
+            Object fragment, Object taskResult, ClassLoader classLoader,
+            DailyShareContext runContext) {
+        if (!isDailyShareContextValid(runContext)) {
+            return DailyShareScheduleResult.CONTEXT_EXPIRED;
+        }
         if (taskResult == null) {
-            return false;
+            return DailyShareScheduleResult.TRANSIENT_FAILURE;
         }
         if (dailyShareInProgress) {
-            return true;
+            return DailyShareScheduleResult.HANDLED;
         }
 
         try {
             Context context = fragment == null ? targetContext : getFragmentContext(fragment);
             if (context == null) {
                 warn("DAILY_TASK_SKIP reason=context_missing");
-                return false;
-            }
-
-            String day = currentDay();
-            String accountKey = resolveDailyAccountKey();
-            if (accountKey.isEmpty()) {
-                warn("DAILY_TASK_SKIP reason=not_logged_in");
-                return false;
+                return DailyShareScheduleResult.TRANSIENT_FAILURE;
             }
             TaskCollectionResult collection = collectShareTasks(taskResult);
             if (!collection.isReliable()) {
                 warn("DAILY_TASK_PARSE_INCOMPATIBLE examined=" + collection.examined
                         + " failures=" + collection.parseFailures
-                        + " structure=" + collection.structureRecognized);
-                return false;
+                        + " structure=" + collection.structureRecognized
+                        + " container=" + collection.taskContainerObserved);
+                return DailyShareScheduleResult.INCOMPATIBLE;
             }
+            if (!isDailyShareContextValid(runContext)) {
+                return DailyShareScheduleResult.CONTEXT_EXPIRED;
+            }
+            clearDailyShareFailureGate(runContext);
+            recordRuntimeSuccess("每日任务结构");
             List<Object> tasks = collection.tasks;
-            synchronized (this) {
-                dailyShareSuppressedDay = "";
-                dailyShareSuppressedAccount = "";
-            }
             if (tasks.isEmpty()) {
-                writeDailyShareState(context, day, accountKey,
-                        DAILY_SHARE_STATE_CONFIRMED, new LinkedHashSet<>());
-                invalidateDailyShareRequest();
+                if (!writeDailyShareStateIfValid(context, runContext,
+                        DAILY_SHARE_STATE_CONFIRMED, new LinkedHashSet<>())) {
+                    return isDailyShareContextValid(runContext)
+                            ? DailyShareScheduleResult.TRANSIENT_FAILURE
+                            : DailyShareScheduleResult.CONTEXT_EXPIRED;
+                }
+                closeDailyShareContext(runContext);
                 info("DAILY_TASK_SKIP reason=no_pending_share_task");
-                return true;
+                return DailyShareScheduleResult.HANDLED;
             }
             info("DAILY_TASK_DISCOVERED count=" + tasks.size()
                     + " titles=" + taskTitles(tasks));
 
             synchronized (this) {
                 if (dailyShareInProgress) {
-                    return true;
+                    return DailyShareScheduleResult.HANDLED;
                 }
-                SharedPreferences runtime = context.getSharedPreferences(
-                        DAILY_RUNTIME_PREFS, Context.MODE_PRIVATE);
-                if (day.equals(runtime.getString(dailyShareDateKey(accountKey), ""))
-                        && DAILY_SHARE_STATE_CONFIRMED.equals(runtime.getString(
-                        dailyShareStateKey(accountKey), ""))) {
-                    invalidateDailyShareRequest();
-                    info("DAILY_TASK_SKIP reason=already_confirmed day=" + day);
-                    return true;
+                if (dailyShareActiveContext == null
+                        || dailyShareActiveContext.generation != runContext.generation
+                        || dailyShareRequestGeneration != runContext.generation) {
+                    return DailyShareScheduleResult.CONTEXT_EXPIRED;
                 }
-                // 这里只写 IN_PROGRESS。进程中断或服务器未确认时，下一次启动会先
-                // 重新读取服务端，仅处理仍处于 pending 的任务；绝不提前写完成态。
-                writeDailyShareState(context, day, accountKey,
-                        DAILY_SHARE_STATE_IN_PROGRESS, collectTaskKeys(tasks));
+            }
+            SharedPreferences runtime = context.getSharedPreferences(
+                    DAILY_RUNTIME_PREFS, Context.MODE_PRIVATE);
+            if (runContext.day.equals(runtime.getString(
+                    dailyShareDateKey(runContext.accountKey), ""))
+                    && DAILY_SHARE_STATE_CONFIRMED.equals(runtime.getString(
+                    dailyShareStateKey(runContext.accountKey), ""))) {
+                closeDailyShareContext(runContext);
+                info("DAILY_TASK_SKIP reason=already_confirmed day=" + runContext.day);
+                return DailyShareScheduleResult.HANDLED;
+            }
+            // 这里只写 IN_PROGRESS。进程中断或服务器未确认时，下一次启动会先
+            // 重新读取服务端，仅处理仍处于 pending 的任务；绝不提前写完成态。
+            if (!writeDailyShareStateIfValid(context, runContext,
+                    DAILY_SHARE_STATE_IN_PROGRESS, collectTaskKeys(tasks))) {
+                return isDailyShareContextValid(runContext)
+                        ? DailyShareScheduleResult.TRANSIENT_FAILURE
+                        : DailyShareScheduleResult.CONTEXT_EXPIRED;
+            }
+            TaskRequestHandle initialRequest;
+            synchronized (this) {
+                if (dailyShareActiveContext == null
+                        || dailyShareActiveContext.generation != runContext.generation
+                        || dailyShareRequestGeneration != runContext.generation) {
+                    return DailyShareScheduleResult.CONTEXT_EXPIRED;
+                }
+                dailyShareFetchRequested = false;
+                dailyShareActiveAttempt = 0;
                 dailyShareInProgress = true;
+                initialRequest = dailyShareActiveRequest;
+                dailyShareActiveRequest = null;
+            }
+            if (initialRequest != null) {
+                initialRequest.cancel();
             }
 
-            info("DAILY_TASK_START day=" + day + " count=" + tasks.size());
+            info("DAILY_TASK_START day=" + runContext.day
+                    + " count=" + tasks.size());
             DailyShareSummary summary = new DailyShareSummary(
-                    tasks.size(), day, accountKey, fragment);
+                    tasks.size(), runContext, fragment);
             for (int index = 0; index < tasks.size(); index++) {
                 final Object task = tasks.get(index);
                 final int taskIndex = index;
-                mainHandler.postDelayed(() -> performDailyShareTask(
-                        fragment, task, taskIndex, summary, classLoader, context),
-                        index * DAILY_SHARE_REPORT_INTERVAL_MS);
+                mainHandler.postDelayed(() -> {
+                    if (isDailyShareContextValid(runContext)) {
+                        performDailyShareTask(fragment, task, taskIndex,
+                                summary, classLoader, context, runContext);
+                    } else {
+                        summary.cancelActiveRequest();
+                        expireDailyShareContext(runContext, classLoader);
+                    }
+                }, index * DAILY_SHARE_REPORT_INTERVAL_MS);
             }
-            mainHandler.postDelayed(() -> finishDailyShareTasks(
-                            summary, context, classLoader),
-                    tasks.size() * DAILY_SHARE_REPORT_INTERVAL_MS + 350L);
-            return true;
+            mainHandler.postDelayed(() -> {
+                if (isDailyShareContextValid(runContext)) {
+                    finishDailyShareTasks(summary, context, classLoader, runContext);
+                } else {
+                    summary.cancelActiveRequest();
+                    expireDailyShareContext(runContext, classLoader);
+                }
+            }, tasks.size() * DAILY_SHARE_REPORT_INTERVAL_MS + 350L);
+            return DailyShareScheduleResult.HANDLED;
         } catch (Throwable throwable) {
-            dailyShareInProgress = false;
             error("DAILY_TASK_SCHEDULE_ERROR", unwrap(throwable));
-            return false;
+            return isDailyShareContextValid(runContext)
+                    ? DailyShareScheduleResult.INCOMPATIBLE
+                    : DailyShareScheduleResult.CONTEXT_EXPIRED;
         }
     }
 
-    private void writeDailyShareState(Context context, String day, String accountKey,
-                                      String state, Set<String> taskKeys) {
+    private boolean writeDailyShareStateIfValid(Context context,
+                                                DailyShareContext runContext,
+                                                String state,
+                                                Set<String> taskKeys) {
+        if (!isDailyShareContextValid(runContext)) {
+            return false;
+        }
+        return writeDailyShareState(context, runContext.day, runContext.accountKey,
+                state, taskKeys);
+    }
+
+    private boolean writeDailyShareState(Context context, String day, String accountKey,
+                                         String state, Set<String> taskKeys) {
         if (context == null || day == null || day.isEmpty()
                 || accountKey == null || accountKey.isEmpty()
                 || state == null || state.isEmpty()) {
-            return;
+            return false;
         }
         SharedPreferences.Editor editor = context.getSharedPreferences(
                         DAILY_RUNTIME_PREFS, Context.MODE_PRIVATE).edit()
@@ -1156,9 +1462,11 @@ public final class HeyBoxModule extends XposedModule {
                     new LinkedHashSet<>(taskKeys));
         }
         // 每个账号每天最多写入数次，使用同步提交确保进程立即被杀时状态仍可恢复。
-        if (!editor.commit()) {
+        boolean committed = editor.commit();
+        if (!committed) {
             warn("DAILY_TASK_STATE_WRITE_FAILED day=" + day + " state=" + state);
         }
+        return committed;
     }
 
     private static String dailyShareDateKey(String accountKey) {
@@ -1220,63 +1528,103 @@ public final class HeyBoxModule extends XposedModule {
     }
 
     @SuppressWarnings("unchecked")
-    private TaskCollectionResult collectShareTasks(Object taskResult) throws Throwable {
+    private TaskCollectionResult collectShareTasks(Object taskResult) {
         TaskCollectionResult result = new TaskCollectionResult();
-        Method getTaskList = taskResult.getClass().getMethod("getTask_list");
-        Object groups = getTaskList.invoke(taskResult);
-        result.structureRecognized = groups == null || groups instanceof List;
-        if (groups instanceof List) {
-            for (Object group : (List<Object>) groups) {
-                if (group == null) {
-                    continue;
+        if (taskResult == null) {
+            return result;
+        }
+        result.structureRecognized = true;
+        try {
+            Method getTaskList = taskResult.getClass().getMethod("getTask_list");
+            Object groups = getTaskList.invoke(taskResult);
+            if (groups != null && !(groups instanceof List)) {
+                result.structureRecognized = false;
+            } else if (groups instanceof List) {
+                List<Object> groupList = (List<Object>) groups;
+                if (groupList.isEmpty()) {
+                    // 服务端明确返回空的根任务区，可以可靠解释为这一块没有任务。
+                    result.taskContainerObserved = true;
                 }
-                Method getTasks = group.getClass().getMethod("getTasks");
-                Object taskList = getTasks.invoke(group);
-                if (taskList != null && !(taskList instanceof List)) {
-                    result.structureRecognized = false;
-                }
-                if (taskList instanceof List) {
-                    for (Object task : (List<Object>) taskList) {
-                        addPendingShareTask(result, task);
+                for (Object group : groupList) {
+                    if (group == null) {
+                        continue;
+                    }
+                    try {
+                        Method getTasks = group.getClass().getMethod("getTasks");
+                        Object taskList = getTasks.invoke(group);
+                        if (taskList != null && !(taskList instanceof List)) {
+                            result.structureRecognized = false;
+                            result.parseFailures++;
+                        } else if (taskList instanceof List) {
+                            result.taskContainerObserved = true;
+                            for (Object task : (List<Object>) taskList) {
+                                addPendingShareTask(result, task);
+                            }
+                        }
+                    } catch (Throwable throwable) {
+                        result.structureRecognized = false;
+                        result.parseFailures++;
+                        warn("DAILY_TASK_GROUP_READ_ERROR error="
+                                + unwrap(throwable).getClass().getSimpleName());
                     }
                 }
             }
+        } catch (Throwable throwable) {
+            result.structureRecognized = false;
+            result.parseFailures++;
+            warn("DAILY_TASK_LIST_READ_ERROR error="
+                    + unwrap(throwable).getClass().getSimpleName());
         }
 
         // task_list 与 task_lines 是并列区域，不是互斥的。之前只有在
         // task_list 为空时才读取 task_lines，导致常见的“两项在 task_list、
         // 游戏评价在 task_lines”响应被漏掉一项。
-        Method getLines;
         try {
-            getLines = taskResult.getClass().getMethod("getTask_lines");
-        } catch (NoSuchMethodException ignored) {
-            // 旧版本没有 task_lines，已经检查过 task_list。
-            return result;
-        }
-        Object lines = getLines.invoke(taskResult);
-        if (lines != null) {
-            Method getItems = lines.getClass().getMethod("getTask_line_items");
-            Object items = getItems.invoke(lines);
-            if (items != null && !(items instanceof List)) {
-                result.structureRecognized = false;
-            }
-            if (items instanceof List) {
-                for (Object line : (List<Object>) items) {
-                    if (line == null) {
-                        continue;
+            Method getLines = taskResult.getClass().getMethod("getTask_lines");
+            Object lines = getLines.invoke(taskResult);
+            if (lines != null) {
+                Method getItems = lines.getClass().getMethod("getTask_line_items");
+                Object items = getItems.invoke(lines);
+                if (items != null && !(items instanceof List)) {
+                    result.structureRecognized = false;
+                    result.parseFailures++;
+                } else if (items instanceof List) {
+                    List<Object> lineItems = (List<Object>) items;
+                    if (lineItems.isEmpty()) {
+                        result.taskContainerObserved = true;
                     }
-                    Method getTasks = line.getClass().getMethod("getTasks");
-                    Object taskList = getTasks.invoke(line);
-                    if (taskList != null && !(taskList instanceof List)) {
-                        result.structureRecognized = false;
-                    }
-                    if (taskList instanceof List) {
-                        for (Object task : (List<Object>) taskList) {
-                            addPendingShareTask(result, task);
+                    for (Object line : lineItems) {
+                        if (line == null) {
+                            continue;
+                        }
+                        try {
+                            Method getTasks = line.getClass().getMethod("getTasks");
+                            Object taskList = getTasks.invoke(line);
+                            if (taskList != null && !(taskList instanceof List)) {
+                                result.structureRecognized = false;
+                                result.parseFailures++;
+                            } else if (taskList instanceof List) {
+                                result.taskContainerObserved = true;
+                                for (Object task : (List<Object>) taskList) {
+                                    addPendingShareTask(result, task);
+                                }
+                            }
+                        } catch (Throwable throwable) {
+                            result.structureRecognized = false;
+                            result.parseFailures++;
+                            warn("DAILY_TASK_LINE_READ_ERROR error="
+                                    + unwrap(throwable).getClass().getSimpleName());
                         }
                     }
                 }
             }
+        } catch (NoSuchMethodException ignored) {
+            // 旧版本没有 task_lines，已经检查过 task_list。
+        } catch (Throwable throwable) {
+            result.structureRecognized = false;
+            result.parseFailures++;
+            warn("DAILY_TASK_LINES_READ_ERROR error="
+                    + unwrap(throwable).getClass().getSimpleName());
         }
         return result;
     }
@@ -1318,15 +1666,13 @@ public final class HeyBoxModule extends XposedModule {
     }
 
     private boolean containsEquivalentTask(List<Object> tasks, Object candidate) {
-        if (tasks.contains(candidate)) {
-            return true;
-        }
         String candidateKey = taskIdentity(candidate);
-        if (candidateKey.isEmpty()) {
-            return false;
-        }
         for (Object existing : tasks) {
-            if (candidateKey.equals(taskIdentity(existing))) {
+            if (existing == candidate) {
+                return true;
+            }
+            if (!candidateKey.isEmpty()
+                    && candidateKey.equals(taskIdentity(existing))) {
                 return true;
             }
         }
@@ -1353,11 +1699,13 @@ public final class HeyBoxModule extends XposedModule {
         if (task == null) {
             return "";
         }
-        for (String getterName : new String[]{"getTask_id", "getTaskId", "getId"}) {
+        // 当前 1.3.347 的 TaskInfoObj 没有业务 ID，因此通常走下方复合键。
+        // 通用 getId() 可能是列表/视图 ID，不能单独作为跨请求任务身份。
+        for (String getterName : new String[]{"getTask_id", "getTaskId"}) {
             try {
                 Method getter = task.getClass().getMethod(getterName);
-                String value = stringValue(getter.invoke(task));
-                if (!value.isEmpty()) {
+                String value = stringValue(getter.invoke(task)).trim();
+                if (isValidStrongTaskId(value)) {
                     return "id:" + value;
                 }
             } catch (Throwable ignored) {
@@ -1365,27 +1713,76 @@ public final class HeyBoxModule extends XposedModule {
             }
         }
         try {
-            String title = stringValue(task.getClass().getMethod("getTitle").invoke(task));
-            String type = stringValue(task.getClass().getMethod("getType").invoke(task));
+            String title = normalizeTaskIdentityPart(
+                    stringValue(task.getClass().getMethod("getTitle").invoke(task)), false);
+            String type = normalizeTaskIdentityPart(
+                    stringValue(task.getClass().getMethod("getType").invoke(task)), true);
             String url = "";
             try {
-                url = stringValue(task.getClass().getMethod("getUrl").invoke(task));
+                url = normalizeTaskIdentityPart(
+                        stringValue(task.getClass().getMethod("getUrl").invoke(task)), false);
             } catch (Throwable ignored) {
                 // 标题与类型在当前任务列表中已经足以稳定区分三个分享任务。
             }
-            return title + "|" + type + "|" + url;
+            if (title.isEmpty() && type.isEmpty() && url.isEmpty()) {
+                return "";
+            }
+            return "fallback:type=" + type + "|title=" + title + "|url=" + url;
         } catch (Throwable ignored) {
             return "";
         }
     }
 
+    private static boolean isValidStrongTaskId(String value) {
+        if (value == null || value.isEmpty()
+                || "0".equals(value) || "-1".equals(value)) {
+            return false;
+        }
+        try {
+            return Long.parseLong(value) > 0L;
+        } catch (NumberFormatException ignored) {
+            // 部分后端可能改用非数字业务 ID；明确的非空 taskId 仍可作为强身份。
+            return true;
+        }
+    }
+
+    private static String normalizeTaskIdentityPart(String value, boolean lowerCase) {
+        if (value == null) {
+            return "";
+        }
+        String trimmed = value.trim();
+        if (trimmed.isEmpty()) {
+            return "";
+        }
+        StringBuilder normalized = new StringBuilder(trimmed.length());
+        boolean previousWhitespace = false;
+        for (int index = 0; index < trimmed.length(); index++) {
+            char current = trimmed.charAt(index);
+            if (Character.isWhitespace(current)) {
+                if (!previousWhitespace) {
+                    normalized.append(' ');
+                    previousWhitespace = true;
+                }
+            } else {
+                normalized.append(current);
+                previousWhitespace = false;
+            }
+        }
+        String result = normalized.toString();
+        return lowerCase ? result.toLowerCase(Locale.ROOT) : result;
+    }
+
     private void performDailyShareTask(Object fragment, Object task, int index,
                                        DailyShareSummary summary, ClassLoader classLoader,
-                                       Context context) {
+                                       Context context,
+                                       DailyShareContext runContext) {
         String title = "";
         try {
-            if (!summary.accountKey.equals(resolveDailyAccountKey())) {
-                throw new IllegalStateException("account changed");
+            if (!dailyShareInProgress || summary.runContext != runContext
+                    || !isDailyShareContextValid(runContext)) {
+                summary.cancelActiveRequest();
+                expireDailyShareContext(runContext, classLoader);
+                return;
             }
             Class<?> fragmentClass = Class.forName(TASK_FRAGMENT, false, classLoader);
             Class<?> taskClass = Class.forName(TASK_INFO, false, classLoader);
@@ -1414,6 +1811,11 @@ public final class HeyBoxModule extends XposedModule {
                     coin = parsed[1];
                 }
             }
+            if (!isDailyShareContextValid(runContext)) {
+                summary.cancelActiveRequest();
+                expireDailyShareContext(runContext, classLoader);
+                return;
+            }
             synchronized (summary) {
                 summary.completed++;
                 summary.exp += exp;
@@ -1431,7 +1833,14 @@ public final class HeyBoxModule extends XposedModule {
     }
 
     private void finishDailyShareTasks(DailyShareSummary summary, Context context,
-                                       ClassLoader classLoader) {
+                                       ClassLoader classLoader,
+                                       DailyShareContext runContext) {
+        if (summary.runContext != runContext
+                || !isDailyShareContextValid(runContext)) {
+            summary.cancelActiveRequest();
+            expireDailyShareContext(runContext, classLoader);
+            return;
+        }
         int completed;
         long exp;
         long coin;
@@ -1441,8 +1850,7 @@ public final class HeyBoxModule extends XposedModule {
             coin = summary.coin;
         }
         if (completed <= 0) {
-            dailyShareInProgress = false;
-            invalidateDailyShareRequest();
+            closeDailyShareContext(runContext);
             warn("DAILY_TASK_FINISH completed=0");
             Toast.makeText(context,
                     "今日分享任务自动完成失败，请在任务页手动完成",
@@ -1454,20 +1862,21 @@ public final class HeyBoxModule extends XposedModule {
                 + " exp=" + exp + " coin=" + coin
                 + " confirm_delay_ms=" + DAILY_SHARE_CONFIRM_DELAY_MS);
         mainHandler.postDelayed(() -> requestDailyShareConfirmation(
-                        summary, context, classLoader, 1),
+                        summary, context, classLoader, runContext, 1),
                 DAILY_SHARE_CONFIRM_DELAY_MS);
     }
 
     /** 分享成功回调只代表请求已提交；重新读取服务端状态后才统计完成数与奖励。 */
     private void requestDailyShareConfirmation(DailyShareSummary summary, Context context,
-                                               ClassLoader classLoader, int attempt) {
-        if (!dailyShareInProgress) {
+                                               ClassLoader classLoader,
+                                               DailyShareContext runContext,
+                                               int attempt) {
+        if (!dailyShareInProgress || summary.runContext != runContext) {
             return;
         }
-        if (!summary.day.equals(currentDay())
-                || !summary.accountKey.equals(resolveDailyAccountKey())) {
-            finishDailyShareConfirmationFailure(
-                    summary, context, "日期或账号已经变化");
+        if (!isDailyShareContextValid(runContext)) {
+            summary.cancelActiveRequest();
+            expireDailyShareContext(runContext, classLoader);
             return;
         }
         AtomicBoolean responseReceived = new AtomicBoolean();
@@ -1479,8 +1888,14 @@ public final class HeyBoxModule extends XposedModule {
                     if (!responseReceived.compareAndSet(false, true)) {
                         return;
                     }
+                    if (!isDailyShareContextValid(runContext)) {
+                        summary.cancelActiveRequest();
+                        expireDailyShareContext(runContext, classLoader);
+                        return;
+                    }
                     handleDailyShareConfirmation(
-                            summary, context, classLoader, taskResult, attempt);
+                            summary, context, classLoader, runContext,
+                            taskResult, attempt);
                 }
 
                 @Override
@@ -1488,8 +1903,14 @@ public final class HeyBoxModule extends XposedModule {
                     if (!responseReceived.compareAndSet(false, true)) {
                         return;
                     }
+                    if (!isDailyShareContextValid(runContext)) {
+                        summary.cancelActiveRequest();
+                        expireDailyShareContext(runContext, classLoader);
+                        return;
+                    }
                     retryOrFinishDailyShareConfirmation(
-                            summary, context, classLoader, attempt, reason);
+                            summary, context, classLoader, runContext,
+                            attempt, reason);
                 }
             });
             requestHolder.set(request);
@@ -1500,30 +1921,54 @@ public final class HeyBoxModule extends XposedModule {
                     if (active != null) {
                         active.cancel();
                     }
-                    retryOrFinishDailyShareConfirmation(summary, context, classLoader,
-                            attempt, "timeout");
+                    if (isDailyShareContextValid(runContext)) {
+                        retryOrFinishDailyShareConfirmation(summary, context,
+                                classLoader, runContext, attempt, "timeout");
+                    } else {
+                        summary.cancelActiveRequest();
+                        expireDailyShareContext(runContext, classLoader);
+                    }
                 }
             }, DAILY_SHARE_FETCH_TIMEOUT_MS);
             info("DAILY_TASK_CONFIRM_REQUEST attempt=" + attempt);
         } catch (Throwable throwable) {
-            retryOrFinishDailyShareConfirmation(summary, context, classLoader,
-                    attempt, unwrap(throwable).getClass().getSimpleName());
+            if (isDailyShareContextValid(runContext)) {
+                retryOrFinishDailyShareConfirmation(summary, context, classLoader,
+                        runContext, attempt,
+                        unwrap(throwable).getClass().getSimpleName());
+            } else {
+                summary.cancelActiveRequest();
+                expireDailyShareContext(runContext, classLoader);
+            }
         }
     }
 
     private void handleDailyShareConfirmation(DailyShareSummary summary, Context context,
-                                              ClassLoader classLoader, Object taskResult,
+                                              ClassLoader classLoader,
+                                              DailyShareContext runContext,
+                                              Object taskResult,
                                               int attempt) {
+        if (summary.runContext != runContext
+                || !isDailyShareContextValid(runContext)) {
+            summary.cancelActiveRequest();
+            expireDailyShareContext(runContext, classLoader);
+            return;
+        }
         try {
             if (taskResult == null) {
                 retryOrFinishDailyShareConfirmation(summary, context, classLoader,
-                        attempt, "empty_result");
+                        runContext, attempt, "empty_result");
                 return;
             }
             TaskCollectionResult collection = collectShareTasks(taskResult);
             if (!collection.isReliable()) {
                 retryOrFinishDailyShareConfirmation(summary, context, classLoader,
-                        attempt, "parse_incompatible");
+                        runContext, attempt, "parse_incompatible");
+                return;
+            }
+            if (!isDailyShareContextValid(runContext)) {
+                summary.cancelActiveRequest();
+                expireDailyShareContext(runContext, classLoader);
                 return;
             }
             List<Object> pendingTasks = collection.tasks;
@@ -1561,20 +2006,29 @@ public final class HeyBoxModule extends XposedModule {
                 info("DAILY_TASK_CONFIRM_PENDING attempt=" + attempt
                         + " confirmed=" + confirmed
                         + " pending=" + pendingTasks.size());
-                mainHandler.postDelayed(() -> requestDailyShareConfirmation(
-                                summary, context, classLoader, attempt + 1),
+                mainHandler.postDelayed(() -> {
+                    if (isDailyShareContextValid(runContext)) {
+                        requestDailyShareConfirmation(summary, context, classLoader,
+                                runContext, attempt + 1);
+                    } else {
+                        summary.cancelActiveRequest();
+                        expireDailyShareContext(runContext, classLoader);
+                    }
+                },
                         DAILY_SHARE_CONFIRM_DELAY_MS);
                 return;
             }
             if (!allConfirmed && schedulePendingDailyShareRepair(
-                    summary, context, classLoader, pendingTasks)) {
+                    summary, context, classLoader, runContext, pendingTasks)) {
                 return;
             }
-            finishDailyShareConfirmation(summary, context, confirmed,
+            finishDailyShareConfirmation(summary, context, classLoader,
+                    runContext, confirmed,
                     confirmedExp, confirmedCoin, pendingTasks.size(), allConfirmed);
         } catch (Throwable throwable) {
             retryOrFinishDailyShareConfirmation(summary, context, classLoader,
-                    attempt, unwrap(throwable).getClass().getSimpleName());
+                    runContext, attempt,
+                    unwrap(throwable).getClass().getSimpleName());
         }
     }
 
@@ -1586,8 +2040,11 @@ public final class HeyBoxModule extends XposedModule {
     private boolean schedulePendingDailyShareRepair(DailyShareSummary summary,
                                                     Context context,
                                                     ClassLoader classLoader,
+                                                    DailyShareContext runContext,
                                                     List<Object> pendingTasks) {
-        if (pendingTasks == null || pendingTasks.isEmpty()) {
+        if (summary.runContext != runContext
+                || !isDailyShareContextValid(runContext)
+                || pendingTasks == null || pendingTasks.isEmpty()) {
             return false;
         }
         List<Object> repairTasks = new ArrayList<>();
@@ -1618,25 +2075,42 @@ public final class HeyBoxModule extends XposedModule {
         for (int index = 0; index < repairTasks.size(); index++) {
             Object task = repairTasks.get(index);
             int repairIndex = index;
-            mainHandler.postDelayed(() -> performDailyShareRepairTask(
-                            summary, task, repairIndex, classLoader),
+            mainHandler.postDelayed(() -> {
+                if (isDailyShareContextValid(runContext)) {
+                    performDailyShareRepairTask(summary, task, repairIndex,
+                            classLoader, runContext);
+                } else {
+                    summary.cancelActiveRequest();
+                    expireDailyShareContext(runContext, classLoader);
+                }
+            },
                     index * DAILY_SHARE_REPORT_INTERVAL_MS);
         }
-        mainHandler.postDelayed(() -> requestDailyShareConfirmation(
-                        summary, context, classLoader, 1),
+        mainHandler.postDelayed(() -> {
+            if (isDailyShareContextValid(runContext)) {
+                requestDailyShareConfirmation(summary, context, classLoader,
+                        runContext, 1);
+            } else {
+                summary.cancelActiveRequest();
+                expireDailyShareContext(runContext, classLoader);
+            }
+        },
                 repairTasks.size() * DAILY_SHARE_REPORT_INTERVAL_MS
                         + DAILY_SHARE_CONFIRM_DELAY_MS);
         return true;
     }
 
     private void performDailyShareRepairTask(DailyShareSummary summary, Object task,
-                                             int index, ClassLoader classLoader) {
+                                             int index, ClassLoader classLoader,
+                                             DailyShareContext runContext) {
         String title = "";
         try {
             if (!dailyShareInProgress
-                    || !summary.day.equals(currentDay())
-                    || !summary.accountKey.equals(resolveDailyAccountKey())) {
-                throw new IllegalStateException("daily task context changed");
+                    || summary.runContext != runContext
+                    || !isDailyShareContextValid(runContext)) {
+                summary.cancelActiveRequest();
+                expireDailyShareContext(runContext, classLoader);
+                return;
             }
             Class<?> taskClass = Class.forName(TASK_INFO, false, classLoader);
             Method getReportExtra = taskClass.getMethod("getReport_extra");
@@ -1659,28 +2133,63 @@ public final class HeyBoxModule extends XposedModule {
     private void retryOrFinishDailyShareConfirmation(DailyShareSummary summary,
                                                      Context context,
                                                      ClassLoader classLoader,
+                                                     DailyShareContext runContext,
                                                      int attempt, String reason) {
+        if (summary.runContext != runContext
+                || !isDailyShareContextValid(runContext)) {
+            summary.cancelActiveRequest();
+            expireDailyShareContext(runContext, classLoader);
+            return;
+        }
         summary.cancelActiveRequest();
         if (attempt < DAILY_SHARE_CONFIRM_MAX_ATTEMPTS) {
             warn("DAILY_TASK_CONFIRM_RETRY attempt=" + attempt
                     + " reason=" + reason);
-            mainHandler.postDelayed(() -> requestDailyShareConfirmation(
-                            summary, context, classLoader, attempt + 1),
+            mainHandler.postDelayed(() -> {
+                if (isDailyShareContextValid(runContext)) {
+                    requestDailyShareConfirmation(summary, context, classLoader,
+                            runContext, attempt + 1);
+                } else {
+                    expireDailyShareContext(runContext, classLoader);
+                }
+            },
                     DAILY_SHARE_RETRY_DELAY_MS);
             return;
         }
-        finishDailyShareConfirmationFailure(summary, context, reason);
+        finishDailyShareConfirmationFailure(
+                summary, context, classLoader, runContext, reason);
     }
 
     private void finishDailyShareConfirmation(DailyShareSummary summary, Context context,
+                                               ClassLoader classLoader,
+                                               DailyShareContext runContext,
                                                int confirmed, long exp, long coin,
                                                int pending, boolean allConfirmed) {
+        if (summary.runContext != runContext
+                || !isDailyShareContextValid(runContext)) {
+            summary.cancelActiveRequest();
+            expireDailyShareContext(runContext, classLoader);
+            return;
+        }
         summary.cancelActiveRequest();
-        dailyShareInProgress = false;
-        invalidateDailyShareRequest();
         if (allConfirmed) {
-            writeDailyShareState(context, summary.day, summary.accountKey,
-                    DAILY_SHARE_STATE_CONFIRMED, new LinkedHashSet<>());
+            if (!writeDailyShareStateIfValid(context, runContext,
+                    DAILY_SHARE_STATE_CONFIRMED, new LinkedHashSet<>())) {
+                if (isDailyShareContextValid(runContext)) {
+                    finishDailyShareConfirmationFailure(summary, context,
+                            classLoader, runContext, "state_write_failed");
+                } else {
+                    expireDailyShareContext(runContext, classLoader);
+                }
+                return;
+            }
+        }
+        if (allConfirmed) {
+            closeDailyShareContext(runContext);
+        } else {
+            // 服务端仍返回 pending 时保留 IN_PROGRESS，并短暂冷却；下次只会
+            // 重新查询并补报仍未完成的任务，不会把部分结果错误写成完成态。
+            applyDailyShareCooldownAndClose(runContext);
         }
         if (confirmed > 0) {
             String message = String.format(Locale.ROOT,
@@ -1705,16 +2214,44 @@ public final class HeyBoxModule extends XposedModule {
     }
 
     private void finishDailyShareConfirmationFailure(DailyShareSummary summary,
-                                                     Context context, String reason) {
+                                                     Context context,
+                                                     ClassLoader classLoader,
+                                                     DailyShareContext runContext,
+                                                     String reason) {
+        if (summary.runContext != runContext
+                || !isDailyShareContextValid(runContext)) {
+            summary.cancelActiveRequest();
+            expireDailyShareContext(runContext, classLoader);
+            return;
+        }
         summary.cancelActiveRequest();
-        dailyShareInProgress = false;
-        invalidateDailyShareRequest();
+        applyDailyShareCooldownAndClose(runContext);
         warn("DAILY_TASK_CONFIRM_FAILED reason=" + reason);
         Toast.makeText(context,
                 "分享任务已提交，但服务器确认失败，请稍后在任务页查看",
                 Toast.LENGTH_SHORT).show();
         Object fragment = summary.fragmentReference.get();
         scheduleSilentTaskRefresh(fragment, "DAILY");
+    }
+
+    private void applyDailyShareCooldownAndClose(DailyShareContext runContext) {
+        synchronized (this) {
+            if (dailyShareActiveContext == null
+                    || dailyShareActiveContext.generation != runContext.generation
+                    || dailyShareRequestGeneration != runContext.generation) {
+                return;
+            }
+            resetDailyShareFailureGateIfContextChangedLocked(
+                    runContext.day, runContext.accountKey);
+            dailyShareTransientFailureRounds++;
+            long cooldownMs = dailyShareTransientFailureRounds <= 1
+                    ? DAILY_SHARE_INITIAL_COOLDOWN_MS
+                    : DAILY_SHARE_MAX_COOLDOWN_MS;
+            dailyShareCooldownDay = runContext.day;
+            dailyShareCooldownAccount = runContext.accountKey;
+            dailyShareRetryAfterElapsed = SystemClock.elapsedRealtime() + cooldownMs;
+        }
+        closeDailyShareContext(runContext);
     }
 
     /** 将同一个任务页在短时间内的多次刷新合并为一次 u4() 请求。 */
@@ -1892,9 +2429,36 @@ public final class HeyBoxModule extends XposedModule {
         int examined;
         int parseFailures;
         boolean structureRecognized;
+        boolean taskContainerObserved;
 
         boolean isReliable() {
-            return structureRecognized && parseFailures == 0;
+            return structureRecognized && taskContainerObserved
+                    && parseFailures == 0;
+        }
+    }
+
+    private enum DailyShareFailureKind {
+        TRANSIENT,
+        INCOMPATIBLE
+    }
+
+    private enum DailyShareScheduleResult {
+        HANDLED,
+        TRANSIENT_FAILURE,
+        INCOMPATIBLE,
+        CONTEXT_EXPIRED
+    }
+
+    /** 一次自动任务流程从列表请求到最终确认始终使用同一个不可变身份。 */
+    private static final class DailyShareContext {
+        final String day;
+        final String accountKey;
+        final long generation;
+
+        DailyShareContext(String day, String accountKey, long generation) {
+            this.day = day;
+            this.accountKey = accountKey;
+            this.generation = generation;
         }
     }
 
@@ -1918,6 +2482,13 @@ public final class HeyBoxModule extends XposedModule {
             this.installed = installed;
             this.expected = expected;
         }
+    }
+
+    private static final class RuntimeHookState {
+        int failureCount;
+        String lastException = "";
+        boolean active;
+        boolean recovered;
     }
 
     /**
@@ -2034,8 +2605,7 @@ public final class HeyBoxModule extends XposedModule {
 
     private static final class DailyShareSummary {
         final int scheduled;
-        final String day;
-        final String accountKey;
+        final DailyShareContext runContext;
         final WeakReference<Object> fragmentReference;
         final List<DailyShareRecord> reports = new ArrayList<>();
         int completed;
@@ -2044,11 +2614,10 @@ public final class HeyBoxModule extends XposedModule {
         boolean repairAttempted;
         private TaskRequestHandle activeRequest;
 
-        DailyShareSummary(int scheduled, String day, String accountKey,
+        DailyShareSummary(int scheduled, DailyShareContext runContext,
                           Object fragment) {
             this.scheduled = scheduled;
-            this.day = day;
-            this.accountKey = accountKey;
+            this.runContext = runContext;
             this.fragmentReference = new WeakReference<>(fragment);
         }
 
@@ -2080,6 +2649,7 @@ public final class HeyBoxModule extends XposedModule {
             Class<?> selectorClass = Class.forName(
                     OPEN_SCREEN_AD_SELECTOR, false, classLoader);
             Method selectAd = selectorClass.getDeclaredMethod("g", boolean.class);
+            requireNullableReturn(selectAd);
             selectAd.setAccessible(true);
             hook(selectAd).intercept(chain -> {
                 info("SPLASH_AD_BYPASS launch=" + chain.getArg(0));
@@ -2096,6 +2666,8 @@ public final class HeyBoxModule extends XposedModule {
             Class<?> splashClass = Class.forName(SPLASH_ACTIVITY, false, classLoader);
             Method splashInitialize = findInheritedMethod(splashClass, "k1");
             Method continueLaunch = splashClass.getMethod("Y1", boolean.class);
+            requireVoidReturn(splashInitialize);
+            requireVoidReturn(continueLaunch);
             Field adBindingField = splashClass.getSuperclass().getDeclaredField("O");
             Class<?> adBindingClass = Class.forName("df.e", false, classLoader);
             Constructor<?> emptyBindingConstructor = null;
@@ -2135,6 +2707,7 @@ public final class HeyBoxModule extends XposedModule {
                     }
                     continueLaunch.invoke(splash, false);
                     info("SPLASH_FAST_BYPASS");
+                    recordRuntimeSuccess("开屏快速路径");
                     return null;
                 } catch (Throwable throwable) {
                     // 目标结构变化时回退原初始化；选择器兼容 Hook 若已安装，
@@ -2411,35 +2984,38 @@ public final class HeyBoxModule extends XposedModule {
                 if (!(value instanceof List<?>)) {
                     return value;
                 }
-                Object model = chain.getThisObject();
-                List<?> source = (List<?>) value;
-                int sourceSize = source.size();
-                long contentStamp = feedContentStamp(source);
-                if (model != null) {
-                    synchronized (cache) {
-                        FeedFilterCache cached = cache.get(model);
-                        if (cached != null && cached.source == value
-                                && cached.sourceSize == sourceSize
-                                && cached.contentStamp == contentStamp) {
-                            return cached.filtered;
+                try {
+                    Object model = chain.getThisObject();
+                    List<?> source = (List<?>) value;
+                    int sourceSize = source.size();
+                    long contentStamp = feedContentStamp(source);
+                    if (model != null) {
+                        synchronized (cache) {
+                            FeedFilterCache cached = cache.get(model);
+                            if (cached != null && cached.source == value
+                                    && cached.sourceSize == sourceSize
+                                    && cached.contentStamp == contentStamp) {
+                                recordRuntimeSuccess("信息流广告过滤");
+                                return cached.filtered;
+                            }
                         }
                     }
-                }
 
-                final Object filtered;
-                try {
-                    filtered = filterFeedAds(value, feedsAdClass);
+                    Object filtered = filterFeedAds(value, feedsAdClass);
+                    if (model != null) {
+                        synchronized (cache) {
+                            cache.put(model, new FeedFilterCache(
+                                    value, sourceSize, contentStamp, filtered));
+                        }
+                    }
+                    recordRuntimeSuccess("信息流广告过滤");
+                    return filtered;
                 } catch (Throwable throwable) {
+                    // 宿主列表可能在计算 size/stamp/filter 期间原位更新；任何模块
+                    // 侧异常都直接回退原始返回值，绝不传播到 RecyclerView 绑定链。
                     recordRuntimeFallback("信息流广告过滤", throwable);
                     return value;
                 }
-                if (model != null) {
-                    synchronized (cache) {
-                        cache.put(model, new FeedFilterCache(
-                                value, sourceSize, contentStamp, filtered));
-                    }
-                }
-                return filtered;
             });
             return 1;
         } catch (Throwable throwable) {
@@ -2456,6 +3032,7 @@ public final class HeyBoxModule extends XposedModule {
                     false, classLoader);
             Method checkClipboard = manager.getDeclaredMethod(
                     "c", Activity.class, boolean.class);
+            requireVoidReturn(checkClipboard);
             checkClipboard.setAccessible(true);
             hook(checkClipboard).intercept(chain -> null);
             recordHookGroup("剪贴板保护");
@@ -2647,6 +3224,7 @@ public final class HeyBoxModule extends XposedModule {
                     "com.max.xiaoheihe.module.game.GameRecommendV2Fragment",
                     false, classLoader);
             Method autoPlayVisibleCard = fragment.getDeclaredMethod("j4");
+            requireVoidReturn(autoPlayVisibleCard);
             autoPlayVisibleCard.setAccessible(true);
             hook(autoPlayVisibleCard).intercept(chain -> null);
             installed++;
@@ -2664,6 +3242,7 @@ public final class HeyBoxModule extends XposedModule {
                     "com.max.xiaoheihe.bean.game.recommend.GameCardVideoObj",
                     false, classLoader);
             Method play = videoView.getDeclaredMethod("l", videoData, boolean.class);
+            requireVoidReturn(play);
             play.setAccessible(true);
             hook(play).intercept(chain -> Boolean.FALSE.equals(chain.getArg(1))
                     ? null : chain.proceed());
@@ -2679,6 +3258,7 @@ public final class HeyBoxModule extends XposedModule {
                     "com.max.xiaoheihe.module.game.GameMobileRecFragment",
                     false, classLoader);
             Method autoPlayAfterScroll = legacyFragment.getDeclaredMethod("t4", int.class);
+            requireVoidReturn(autoPlayAfterScroll);
             autoPlayAfterScroll.setAccessible(true);
             hook(autoPlayAfterScroll).intercept(chain -> null);
 
@@ -2731,6 +3311,7 @@ public final class HeyBoxModule extends XposedModule {
                     Object disabledOptions = disableAnimation.invoke(options);
                     arguments = chain.getArgs().toArray();
                     arguments[1] = disabledOptions;
+                    recordRuntimeSuccess("GIF静止");
                 } catch (Throwable throwable) {
                     recordRuntimeFallback("GIF静止", throwable);
                     return chain.proceed();
@@ -2783,6 +3364,7 @@ public final class HeyBoxModule extends XposedModule {
             Method visibilityChanged = newsTagList.getMethod(
                     "onHiddenChanged", boolean.class);
             Method autoRefresh = newsTagList.getMethod("D3");
+            requireVoidReturn(autoRefresh);
             hook(visibilityChanged).intercept(chain -> {
                 if (!Boolean.FALSE.equals(chain.getArg(0))) {
                     return chain.proceed();
@@ -2873,6 +3455,7 @@ public final class HeyBoxModule extends XposedModule {
                 Object result = chain.proceed();
                 Object data = chain.getArg(0);
                 TextView originalButton = (TextView) chain.getArg(1);
+                boolean enhancementFailed = false;
                 try {
                     boolean currentPage;
                     boolean loaded;
@@ -2893,7 +3476,12 @@ public final class HeyBoxModule extends XposedModule {
                                 isOriginal, getOriginalUrl);
                     }
                 } catch (Throwable throwable) {
+                    enhancementFailed = true;
                     recordRuntimeFallback("自动加载原图", throwable);
+                } finally {
+                    if (!enhancementFailed) {
+                        recordRuntimeSuccess("自动加载原图");
+                    }
                 }
                 return result;
             });
@@ -2913,6 +3501,7 @@ public final class HeyBoxModule extends XposedModule {
         if (data == null || originalButton == null) {
             return;
         }
+        boolean requestFailed = false;
         try {
             if (Boolean.TRUE.equals(isOriginal.invoke(data))
                     || stringValue(getOriginalUrl.invoke(data)).isEmpty()
@@ -2932,6 +3521,7 @@ public final class HeyBoxModule extends XposedModule {
             }
             originalButton.post(() -> {
                 boolean keepRegistered = false;
+                boolean clickFailed = false;
                 try {
                     synchronized (requestedOriginalImages) {
                         if (selectedViewerImage.get() != data
@@ -2943,8 +3533,12 @@ public final class HeyBoxModule extends XposedModule {
                     keepRegistered = originalButton.isAttachedToWindow()
                             && originalButton.performClick();
                 } catch (Throwable throwable) {
+                    clickFailed = true;
                     recordRuntimeFallback("自动加载原图", throwable);
                 } finally {
+                    if (!clickFailed) {
+                        recordRuntimeSuccess("自动加载原图");
+                    }
                     if (!keepRegistered) {
                         synchronized (requestedOriginalImages) {
                             requestedOriginalImages.remove(data);
@@ -2953,10 +3547,15 @@ public final class HeyBoxModule extends XposedModule {
                 }
             });
         } catch (Throwable throwable) {
+            requestFailed = true;
             synchronized (requestedOriginalImages) {
                 requestedOriginalImages.remove(data);
             }
             recordRuntimeFallback("自动加载原图", throwable);
+        } finally {
+            if (!requestFailed) {
+                recordRuntimeSuccess("自动加载原图");
+            }
         }
     }
 
@@ -3032,6 +3631,7 @@ public final class HeyBoxModule extends XposedModule {
                             ((TextView) child).setTextIsSelectable(true);
                         }
                     }
+                    recordRuntimeSuccess("帖子正文文字选择");
                 } catch (Throwable throwable) {
                     recordRuntimeFallback("帖子正文文字选择", throwable);
                 }
@@ -3055,6 +3655,21 @@ public final class HeyBoxModule extends XposedModule {
             }
         }
         throw new NoSuchMethodException(type.getName() + "." + name);
+    }
+
+    private static void requireVoidReturn(Method method) throws NoSuchMethodException {
+        if (method.getReturnType() != void.class) {
+            throw new NoSuchMethodException(method.getDeclaringClass().getName()
+                    + "." + method.getName() + " return type is not void");
+        }
+    }
+
+    private static void requireNullableReturn(Method method) throws NoSuchMethodException {
+        Class<?> returnType = method.getReturnType();
+        if (returnType == void.class || returnType.isPrimitive()) {
+            throw new NoSuchMethodException(method.getDeclaringClass().getName()
+                    + "." + method.getName() + " cannot return null");
+        }
     }
 
     /** 在小黑盒原生设置列表中插入一个使用原生 SettingItemView 的入口。 */
@@ -3082,6 +3697,7 @@ public final class HeyBoxModule extends XposedModule {
                 try {
                     addSettingsEntry(activity, itemConstructor, setTitle, setTitleDesc,
                             setRightDesc, setRightType, arrow);
+                    recordRuntimeSuccess("设置入口渲染");
                 } catch (Throwable throwable) {
                     recordRuntimeFallback("设置入口渲染", throwable);
                     error("SETTINGS_ENTRY_ERROR", unwrap(throwable));
@@ -3167,9 +3783,19 @@ public final class HeyBoxModule extends XposedModule {
         synchronized (hookGroupProgress) {
             progress = new LinkedHashMap<>(hookGroupProgress);
         }
-        Set<String> runtimeFailures;
-        synchronized (runtimeHookFailures) {
-            runtimeFailures = new LinkedHashSet<>(runtimeHookFailures);
+        List<String> activeRuntimeFailures = new ArrayList<>();
+        List<String> recoveredRuntimeFailures = new ArrayList<>();
+        synchronized (runtimeHookStates) {
+            for (Map.Entry<String, RuntimeHookState> entry : runtimeHookStates.entrySet()) {
+                RuntimeHookState state = entry.getValue();
+                String detail = entry.getKey() + "（" + state.lastException
+                        + "，累计 " + state.failureCount + " 次）";
+                if (state.active) {
+                    activeRuntimeFailures.add(detail);
+                } else if (state.recovered) {
+                    recoveredRuntimeFailures.add(detail);
+                }
+            }
         }
         List<String> missing = new ArrayList<>();
         List<String> partial = new ArrayList<>();
@@ -3184,15 +3810,19 @@ public final class HeyBoxModule extends XposedModule {
             }
         }
         String enabled = enabledFeatureSummary();
-        boolean healthy = missing.isEmpty() && partial.isEmpty()
-                && runtimeFailures.isEmpty();
+        boolean installationComplete = missing.isEmpty() && partial.isEmpty();
+        String runtimeStatus = activeRuntimeFailures.isEmpty()
+                ? (recoveredRuntimeFailures.isEmpty() ? "正常" : "曾发生异常，现已恢复")
+                : activeRuntimeFailures.size() + " 项当前异常";
         List<String> progressDetails = new ArrayList<>();
         for (Map.Entry<String, HookGroupProgress> entry : progress.entrySet()) {
             HookGroupProgress value = entry.getValue();
             progressDetails.add(entry.getKey() + " " + value.installed
                     + "/" + value.expected);
         }
-        return "Hook 状态  " + (healthy ? "安装完整" : "部分功能异常")
+        return "Hook 安装状态  "
+                + (installationComplete ? "完整" : "部分缺失")
+                + "\n运行状态  " + runtimeStatus
                 + "\n模块版本  " + MODULE_VERSION
                 + "\n目标版本  " + readTargetVersion(targetContext)
                 + "\n目标进程  " + currentProcessName
@@ -3204,8 +3834,10 @@ public final class HeyBoxModule extends XposedModule {
                 ? "无" : String.join("、", missing))
                 + "\n部分安装  " + (partial.isEmpty()
                 ? "无" : String.join("、", partial))
-                + "\n运行期回退  " + (runtimeFailures.isEmpty()
-                ? "无" : String.join("、", runtimeFailures))
+                + "\n当前运行异常  " + (activeRuntimeFailures.isEmpty()
+                ? "无" : String.join("、", activeRuntimeFailures))
+                + "\n已恢复异常  " + (recoveredRuntimeFailures.isEmpty()
+                ? "无" : String.join("、", recoveredRuntimeFailures))
                 + "\n本次进程已启用  " + (enabled.isEmpty() ? "无" : enabled);
     }
 
@@ -4500,17 +5132,64 @@ public final class HeyBoxModule extends XposedModule {
         }
     }
 
-    /** 热路径结构变化时只记录一次并回退宿主原逻辑，避免日志风暴。 */
+    /** 运行异常按 Hook 名聚合；同一 Hook 后续成功时可以恢复健康状态。 */
     private void recordRuntimeFallback(String hook, Throwable throwable) {
         Throwable cause = unwrap(throwable);
-        String detail = hook + ":" + cause.getClass().getSimpleName();
-        boolean first;
-        synchronized (runtimeHookFailures) {
-            first = runtimeHookFailures.add(detail);
+        recordRuntimeFailure(hook, cause.getClass().getSimpleName());
+    }
+
+    private void recordRuntimeFailure(String hook, String exceptionName) {
+        boolean becameActive;
+        synchronized (runtimeHookStates) {
+            RuntimeHookState state = runtimeHookStates.get(hook);
+            if (state == null) {
+                state = new RuntimeHookState();
+                runtimeHookStates.put(hook, state);
+            }
+            becameActive = !state.active;
+            if (state.failureCount < Integer.MAX_VALUE) {
+                state.failureCount++;
+            }
+            state.lastException = exceptionName;
+            state.active = true;
+            state.recovered = false;
+            Set<String> activeNames = activeRuntimeHookNames;
+            if (!activeNames.contains(hook)) {
+                LinkedHashSet<String> updated = new LinkedHashSet<>(activeNames);
+                updated.add(hook);
+                activeRuntimeHookNames = Collections.unmodifiableSet(updated);
+            }
         }
-        if (first) {
+        if (becameActive) {
             warn("RUNTIME_HOOK_FALLBACK hook=" + hook
-                    + " reason=" + cause.getClass().getSimpleName());
+                    + " reason=" + exceptionName);
+        }
+    }
+
+    /** 正常热路径没有故障时只读一次 volatile，不进入 Map 也不加锁。 */
+    private void recordRuntimeSuccess(String hook) {
+        if (!activeRuntimeHookNames.contains(hook)) {
+            return;
+        }
+        boolean recovered = false;
+        synchronized (runtimeHookStates) {
+            RuntimeHookState state = runtimeHookStates.get(hook);
+            if (state != null && state.active) {
+                state.active = false;
+                state.recovered = true;
+                recovered = true;
+            }
+            Set<String> activeNames = activeRuntimeHookNames;
+            if (activeNames.contains(hook)) {
+                LinkedHashSet<String> updated = new LinkedHashSet<>(activeNames);
+                updated.remove(hook);
+                activeRuntimeHookNames = updated.isEmpty()
+                        ? Collections.emptySet()
+                        : Collections.unmodifiableSet(updated);
+            }
+        }
+        if (recovered) {
+            info("RUNTIME_HOOK_RECOVERED hook=" + hook);
         }
     }
 
