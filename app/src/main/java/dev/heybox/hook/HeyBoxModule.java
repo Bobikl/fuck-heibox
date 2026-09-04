@@ -89,6 +89,8 @@ public final class HeyBoxModule extends XposedModule {
     private static final long DAILY_SHARE_FETCH_TIMEOUT_MS = 20000L;
     private static final long DAILY_SHARE_CONFIRM_DELAY_MS = 3000L;
     private static final int DAILY_SHARE_CONFIRM_MAX_ATTEMPTS = 2;
+    /** 避免三个埋点在同一个服务端去重/批处理窗口中互相覆盖。 */
+    private static final long DAILY_SHARE_REPORT_INTERVAL_MS = 900L;
     private static final boolean VERBOSE_TASK_LOG = false;
 
     private static final String[] CENTER_VIEW_NAMES = {
@@ -151,16 +153,15 @@ public final class HeyBoxModule extends XposedModule {
     private final Map<Object, Runnable> pendingTaskRefreshes = new WeakHashMap<>();
     private final Map<Activity, List<WeakReference<View>>> centerNavigationViews =
             new WeakHashMap<>();
-    private final Set<Object> requestedOriginalImages =
-            Collections.newSetFromMap(new WeakHashMap<>());
+    private final WeakIdentitySet<Object> requestedOriginalImages = new WeakIdentitySet<>();
     /** 已由查看器普通图片加载器回调确认完成的图片。 */
-    private final Set<Object> loadedViewerImages =
-            Collections.newSetFromMap(new WeakHashMap<>());
-    /** 原图元数据先于普通图加载完成时，暂存当前页面的原图按钮。 */
-    private final Map<Object, WeakReference<TextView>> pendingOriginalButtons =
-            new WeakHashMap<>();
-    /** 防止翻页后误点被复用到另一张图片上的按钮。 */
-    private final Map<TextView, Object> originalButtonOwners = new WeakHashMap<>();
+    private final WeakIdentitySet<Object> loadedViewerImages = new WeakIdentitySet<>();
+    /** 只追踪当前选中的查看器页面，滑走后不会继续加载上一张或预加载下一张原图。 */
+    private volatile WeakReference<Object> selectedViewerImage = new WeakReference<>(null);
+    private volatile WeakReference<TextView> selectedOriginalButton =
+            new WeakReference<>(null);
+    /** 标记 BaseResUICustomizer.y() 同步调用 K() 的页面选择绑定栈。 */
+    private final ThreadLocal<Boolean> selectingViewerPage = new ThreadLocal<>();
     /** 只在 NewsTagListFragment.onHiddenChanged(false) 的同步调用栈内生效。 */
     private final ThreadLocal<Boolean> suppressHomeVisibilityRefresh = new ThreadLocal<>();
     private volatile Resources centerNavigationResources;
@@ -1039,10 +1040,11 @@ public final class HeyBoxModule extends XposedModule {
                 final int taskIndex = index;
                 mainHandler.postDelayed(() -> performDailyShareTask(
                         fragment, task, taskIndex, summary, classLoader, context),
-                        index * 450L);
+                        index * DAILY_SHARE_REPORT_INTERVAL_MS);
             }
             mainHandler.postDelayed(() -> finishDailyShareTasks(
-                    summary, context, classLoader), tasks.size() * 450L + 350L);
+                            summary, context, classLoader),
+                    tasks.size() * DAILY_SHARE_REPORT_INTERVAL_MS + 350L);
             return true;
         } catch (Throwable throwable) {
             dailyShareInProgress = false;
@@ -1402,11 +1404,93 @@ public final class HeyBoxModule extends XposedModule {
                         DAILY_SHARE_CONFIRM_DELAY_MS);
                 return;
             }
+            if (!allConfirmed && schedulePendingDailyShareRepair(
+                    summary, context, classLoader, pendingTasks)) {
+                return;
+            }
             finishDailyShareConfirmation(summary, context, confirmed,
                     confirmedExp, confirmedCoin, pendingTasks.size(), allConfirmed);
         } catch (Throwable throwable) {
             retryOrFinishDailyShareConfirmation(summary, context, classLoader,
                     attempt, unwrap(throwable).getClass().getSimpleName());
+        }
+    }
+
+    /**
+     * 两次服务端确认后，仅补报本轮最初提交但仍处于待完成状态的任务一次。
+     * 正常成功路径不会进入这里，因此不会增加日常请求；补报仍在同一次启动流程中，
+     * 也不会破坏“每天只自动执行一次”的语义。
+     */
+    private boolean schedulePendingDailyShareRepair(DailyShareSummary summary,
+                                                    Context context,
+                                                    ClassLoader classLoader,
+                                                    List<Object> pendingTasks) {
+        if (pendingTasks == null || pendingTasks.isEmpty()) {
+            return false;
+        }
+        List<Object> repairTasks = new ArrayList<>();
+        synchronized (summary) {
+            if (summary.repairAttempted) {
+                return false;
+            }
+            Set<String> scheduledKeys = new LinkedHashSet<>();
+            for (DailyShareRecord record : summary.reports) {
+                if (!record.taskKey.isEmpty()) {
+                    scheduledKeys.add(record.taskKey);
+                }
+            }
+            for (Object task : pendingTasks) {
+                String key = taskIdentity(task);
+                if (!key.isEmpty() && scheduledKeys.contains(key)) {
+                    repairTasks.add(task);
+                }
+            }
+            if (repairTasks.isEmpty()) {
+                return false;
+            }
+            summary.repairAttempted = true;
+        }
+
+        info("DAILY_TASK_REPAIR_START count=" + repairTasks.size()
+                + " titles=" + taskTitles(repairTasks));
+        for (int index = 0; index < repairTasks.size(); index++) {
+            Object task = repairTasks.get(index);
+            int repairIndex = index;
+            mainHandler.postDelayed(() -> performDailyShareRepairTask(
+                            summary, task, repairIndex, classLoader),
+                    index * DAILY_SHARE_REPORT_INTERVAL_MS);
+        }
+        mainHandler.postDelayed(() -> requestDailyShareConfirmation(
+                        summary, context, classLoader, 1),
+                repairTasks.size() * DAILY_SHARE_REPORT_INTERVAL_MS
+                        + DAILY_SHARE_CONFIRM_DELAY_MS);
+        return true;
+    }
+
+    private void performDailyShareRepairTask(DailyShareSummary summary, Object task,
+                                             int index, ClassLoader classLoader) {
+        String title = "";
+        try {
+            if (!dailyShareInProgress
+                    || !summary.day.equals(currentDay())
+                    || !summary.accountKey.equals(resolveDailyAccountKey())) {
+                throw new IllegalStateException("daily task context changed");
+            }
+            Class<?> taskClass = Class.forName(TASK_INFO, false, classLoader);
+            Method getReportExtra = taskClass.getMethod("getReport_extra");
+            Method getTitle = taskClass.getMethod("getTitle");
+            Object reportExtra = getReportExtra.invoke(task);
+            title = stringValue(getTitle.invoke(task));
+            String source = resolveShareSource(title, reportExtra);
+            Object reportingListener = createReportingListener(
+                    source, createSilentShareListener(classLoader),
+                    reportExtra, classLoader);
+            String media = dispatchShareSuccess(reportingListener, classLoader);
+            info("DAILY_TASK_REPAIR_OK index=" + index
+                    + " title=" + title + " src=" + source + " media=" + media);
+        } catch (Throwable throwable) {
+            error("DAILY_TASK_REPAIR_ERROR index=" + index + " title=" + title,
+                    unwrap(throwable));
         }
     }
 
@@ -1592,6 +1676,50 @@ public final class HeyBoxModule extends XposedModule {
         void onFailure(String reason);
     }
 
+    /**
+     * WeakHashMap 依赖对象的 equals/hashCode，而 MediaData 会在加载过程中把 URL、
+     * 原图地址和状态写回自身，导致 hashCode 改变后无法再命中。查看器图片数量很小，
+     * 使用弱引用线性表按对象身份比较既不会持有页面，也避开可变哈希问题。
+     */
+    private static final class WeakIdentitySet<T> {
+        private final List<WeakReference<T>> entries = new ArrayList<>();
+
+        boolean contains(T target) {
+            if (target == null) {
+                return false;
+            }
+            for (int index = entries.size() - 1; index >= 0; index--) {
+                T value = entries.get(index).get();
+                if (value == null) {
+                    entries.remove(index);
+                } else if (value == target) {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        boolean add(T target) {
+            if (target == null || contains(target)) {
+                return false;
+            }
+            entries.add(new WeakReference<>(target));
+            return true;
+        }
+
+        boolean remove(T target) {
+            boolean removed = false;
+            for (int index = entries.size() - 1; index >= 0; index--) {
+                T value = entries.get(index).get();
+                if (value == null || value == target) {
+                    entries.remove(index);
+                    removed |= value == target;
+                }
+            }
+            return removed;
+        }
+    }
+
     private static final class DailyShareRecord {
         final String taskKey;
         final long exp;
@@ -1613,6 +1741,7 @@ public final class HeyBoxModule extends XposedModule {
         int completed;
         long exp;
         long coin;
+        boolean repairAttempted;
 
         DailyShareSummary(int scheduled, String day, String accountKey,
                           Object fragment) {
@@ -2301,22 +2430,41 @@ public final class HeyBoxModule extends XposedModule {
             Method isOriginal = mediaData.getMethod("j");
             Method getOriginalUrl = mediaData.getMethod("g");
             Method updateLoadedUrl = mediaData.getMethod("H", String.class);
+            Class<?> viewHolder = Class.forName(
+                    "androidx.recyclerview.widget.RecyclerView$ViewHolder",
+                    false, classLoader);
+            Method pageSelected = customizer.getMethod("y", int.class, viewHolder,
+                    TextView.class, TextView.class, android.widget.ImageView.class);
+
+            // y() 是查看器真正的 onPageSelected 入口。进入下一页时先使上一页失效，
+            // 并只允许 y() 同步触发的首次 K() 登记新的当前 MediaData。
+            hook(pageSelected).intercept(chain -> {
+                synchronized (requestedOriginalImages) {
+                    selectedViewerImage = new WeakReference<>(null);
+                    selectedOriginalButton = new WeakReference<>(null);
+                }
+                selectingViewerPage.set(Boolean.TRUE);
+                try {
+                    return chain.proceed();
+                } finally {
+                    selectingViewerPage.remove();
+                }
+            });
 
             // HBImageLoader 仅在 Glide 的 onResourceReady 回调中写入当前 URL；因此 H()
             // 返回时可以视为普通图片已真正加载完成，而不是仅完成页面或按钮绑定。
             hook(updateLoadedUrl).intercept(chain -> {
                 Object result = chain.proceed();
                 Object data = chain.getThisObject();
-                TextView pendingButton = null;
+                TextView currentButton = null;
                 synchronized (requestedOriginalImages) {
                     loadedViewerImages.add(data);
-                    WeakReference<TextView> reference = pendingOriginalButtons.remove(data);
-                    if (reference != null) {
-                        pendingButton = reference.get();
+                    if (selectedViewerImage.get() == data) {
+                        currentButton = selectedOriginalButton.get();
                     }
                 }
-                if (pendingButton != null) {
-                    requestOriginalImage(data, pendingButton,
+                if (currentButton != null) {
+                    requestOriginalImage(data, currentButton,
                             isOriginal, getOriginalUrl);
                 }
                 return result;
@@ -2327,35 +2475,31 @@ public final class HeyBoxModule extends XposedModule {
                 Object data = chain.getArg(0);
                 TextView originalButton = (TextView) chain.getArg(1);
                 try {
-                    if (data == null || originalButton == null) {
-                        return result;
-                    }
+                    boolean currentPage;
                     boolean loaded;
                     synchronized (requestedOriginalImages) {
-                        originalButtonOwners.put(originalButton, data);
-                        if (requestedOriginalImages.contains(data)) {
-                            return result;
+                        if (Boolean.TRUE.equals(selectingViewerPage.get())) {
+                            selectedViewerImage = new WeakReference<>(data);
+                            selectedOriginalButton = new WeakReference<>(originalButton);
                         }
-                        loaded = loadedViewerImages.contains(data);
-                        if (!loaded) {
-                            pendingOriginalButtons.put(
-                                    data, new WeakReference<>(originalButton));
-                        }
+                        currentPage = selectedViewerImage.get() == data
+                                && selectedOriginalButton.get() == originalButton;
+                        loaded = currentPage && loadedViewerImages.contains(data);
+                    }
+                    if (data == null || originalButton == null) {
+                        return result;
                     }
                     if (loaded) {
                         requestOriginalImage(data, originalButton,
                                 isOriginal, getOriginalUrl);
                     }
                 } catch (Throwable throwable) {
-                    synchronized (requestedOriginalImages) {
-                        pendingOriginalButtons.remove(data);
-                    }
                     recordRuntimeFallback("自动加载原图", throwable);
                 }
                 return result;
             });
             recordHookGroup("图片增强");
-            info("HOOK_IMAGE_ENHANCE_OK method=MediaData.H->BaseResUICustomizer.K");
+            info("HOOK_IMAGE_ENHANCE_OK method=BaseResUICustomizer.y/K+MediaData.H");
         } catch (Throwable throwable) {
             error("HOOK_IMAGE_ENHANCE_ERROR", throwable);
         }
@@ -2381,17 +2525,18 @@ public final class HeyBoxModule extends XposedModule {
                 return;
             }
             synchronized (requestedOriginalImages) {
-                if (originalButtonOwners.get(originalButton) != data
+                if (selectedViewerImage.get() != data
+                        || selectedOriginalButton.get() != originalButton
                         || !requestedOriginalImages.add(data)) {
                     return;
                 }
-                pendingOriginalButtons.remove(data);
             }
             originalButton.post(() -> {
                 boolean keepRegistered = false;
                 try {
                     synchronized (requestedOriginalImages) {
-                        if (originalButtonOwners.get(originalButton) != data) {
+                        if (selectedViewerImage.get() != data
+                                || selectedOriginalButton.get() != originalButton) {
                             requestedOriginalImages.remove(data);
                             return;
                         }
