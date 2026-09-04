@@ -2,7 +2,7 @@
 
 小黑盒 LSPosed 模块，使用现代 Xposed API（API 102）开发。
 
-当前版本：`0.7.5`
+当前版本：`0.8.0`
 
 主要功能：
 
@@ -16,7 +16,6 @@
 - 从其他底部页面返回首页时不自动回顶刷新（手动下拉刷新不受影响）
 - 全屏图片查看器按当前页懒加载原图，可选仅 Wi-Fi 自动加载，不预取相邻图片
 - 仅对帖子正文渲染器强制开启文字选择与复制
-- 版本号与版本检测相关适配
 - 旧版本升级提示弹窗抑制
 - 启动后自动任务请求、有限网络重试与服务端完成状态确认
 - 多任务静默刷新防抖和热路径缓存
@@ -42,6 +41,9 @@ gradle :app:assembleRelease --no-daemon
 ```text
 app/build/outputs/apk/release/app-release.apk
 ```
+
+正式发布必须提供固定 Release 签名；缺少签名配置时只会生成 unsigned Release，
+不会回退到 debug key。配置方法及证书指纹见 [`SIGNING.md`](SIGNING.md)。
 
 ## 静态分析资料
 

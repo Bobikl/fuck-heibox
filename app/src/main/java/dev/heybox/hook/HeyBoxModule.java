@@ -3,12 +3,13 @@ package dev.heybox.hook;
 import android.app.Activity;
 import android.app.Application;
 import android.app.Instrumentation;
+import android.content.ComponentName;
 import android.content.Context;
 import android.content.Intent;
 import android.content.SharedPreferences;
-import android.content.res.Resources;
 import android.content.pm.PackageInfo;
 import android.content.pm.ResolveInfo;
+import android.content.res.Resources;
 import android.net.Uri;
 import android.net.ConnectivityManager;
 import android.net.Network;
@@ -30,11 +31,15 @@ import java.lang.reflect.Method;
 import java.lang.reflect.Modifier;
 import java.lang.reflect.Constructor;
 import java.lang.reflect.Proxy;
+import java.lang.ref.ReferenceQueue;
 import java.lang.ref.WeakReference;
 import java.time.LocalDate;
+import java.time.ZoneId;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.IdentityHashMap;
+import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
@@ -42,6 +47,7 @@ import java.util.Set;
 import java.util.Map;
 import java.util.WeakHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
 
 import io.github.libxposed.api.XposedModule;
 
@@ -72,8 +78,6 @@ public final class HeyBoxModule extends XposedModule {
     private static final String SPLASH_ACTIVITY = "com.max.xiaoheihe.SplashActivity";
     private static final String TARGET_SETTINGS_ACTIVITY =
             "com.max.xiaoheihe.module.account.SettingActivity";
-    private static final String HOME_GO_TOP_ACTION =
-            "com.max.xiaoheihe.news.gotop";
     private static final String SETTING_ITEM_VIEW =
             "com.max.xiaoheihe.module.account.component.SettingItemView";
     private static final String CHECK_VERSION_OBJECT =
@@ -83,6 +87,11 @@ public final class HeyBoxModule extends XposedModule {
     private static final int CURRENT_TASK_STATE_CONTAINER_ID = 0x7f0a14c0;
     private static final String DAILY_RUNTIME_PREFS = "heybox_hook_runtime";
     private static final String DAILY_SHARE_DATE_PREFIX = "daily_share_date:";
+    private static final String DAILY_SHARE_STATE_PREFIX = "daily_share_state:";
+    private static final String DAILY_SHARE_TASKS_PREFIX = "daily_share_tasks:";
+    private static final String DAILY_SHARE_STATE_IN_PROGRESS = "IN_PROGRESS";
+    private static final String DAILY_SHARE_STATE_CONFIRMED = "CONFIRMED";
+    private static final ZoneId DAILY_TASK_ZONE = ZoneId.of("Asia/Shanghai");
     private static final long DAILY_SHARE_START_DELAY_MS = 3500L;
     private static final long DAILY_SHARE_RETRY_DELAY_MS = 5000L;
     private static final int DAILY_SHARE_MAX_FETCH_ATTEMPTS = 2;
@@ -149,6 +158,9 @@ public final class HeyBoxModule extends XposedModule {
     private volatile boolean dailyShareFetchRequested;
     private long dailyShareRequestGeneration;
     private int dailyShareActiveAttempt;
+    private volatile TaskRequestHandle dailyShareActiveRequest;
+    private String dailyShareSuppressedDay = "";
+    private String dailyShareSuppressedAccount = "";
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
     private final Map<Object, Runnable> pendingTaskRefreshes = new WeakHashMap<>();
     private final Map<Activity, List<WeakReference<View>>> centerNavigationViews =
@@ -168,6 +180,7 @@ public final class HeyBoxModule extends XposedModule {
     private volatile int[] centerNavigationIds;
     private String currentProcessName = "";
     private final Set<String> installedHookGroups = new LinkedHashSet<>();
+    private final Map<String, HookGroupProgress> hookGroupProgress = new LinkedHashMap<>();
     private final Set<String> runtimeHookFailures = new LinkedHashSet<>();
 
     @Override
@@ -319,8 +332,8 @@ public final class HeyBoxModule extends XposedModule {
             installDailyTaskHook(classLoader);
         }
         installSettingsEntryHook(classLoader);
-        if (spoofVersionSnapshot || suppressUpdatePromptSnapshot) {
-            installVersionSpoofHooks(classLoader);
+        if (suppressUpdatePromptSnapshot) {
+            installUpdateSuppressionHooks(classLoader);
         }
         if (skipSplashAdSnapshot) {
             installSplashAdHook(classLoader);
@@ -791,13 +804,23 @@ public final class HeyBoxModule extends XposedModule {
             return;
         }
         String day = currentDay();
-        if (day.equals(context.getSharedPreferences(
-                DAILY_RUNTIME_PREFS, Context.MODE_PRIVATE)
-                .getString(dailyShareDateKey(accountKey), ""))) {
+        DailyShareRuntimeState runtimeState = readDailyShareState(
+                context, accountKey);
+        if (day.equals(runtimeState.day)
+                && DAILY_SHARE_STATE_CONFIRMED.equals(runtimeState.state)) {
             return;
+        }
+        if (day.equals(runtimeState.day)
+                && DAILY_SHARE_STATE_IN_PROGRESS.equals(runtimeState.state)) {
+            info("DAILY_TASK_RECOVERY_SCHEDULED day=" + day
+                    + " previous_tasks=" + runtimeState.taskKeys.size());
         }
         final long generation;
         synchronized (this) {
+            if (day.equals(dailyShareSuppressedDay)
+                    && accountKey.equals(dailyShareSuppressedAccount)) {
+                return;
+            }
             if (dailyShareFetchRequested || dailyShareInProgress) {
                 return;
             }
@@ -823,8 +846,9 @@ public final class HeyBoxModule extends XposedModule {
             return;
         }
         AtomicBoolean responseReceived = new AtomicBoolean();
+        AtomicReference<TaskRequestHandle> requestHolder = new AtomicReference<>();
         try {
-            requestTaskListOnce(classLoader, new TaskListCallback() {
+            TaskRequestHandle request = requestTaskListOnce(classLoader, new TaskListCallback() {
                 @Override
                 public void onResult(Object taskResult) {
                     responseReceived.set(true);
@@ -852,9 +876,15 @@ public final class HeyBoxModule extends XposedModule {
                     }
                 }
             });
+            requestHolder.set(request);
+            replaceDailyShareActiveRequest(request, generation, attempt);
             mainHandler.postDelayed(() -> {
                 if (!responseReceived.get()
                         && isDailyShareRequestActive(generation, attempt)) {
+                    TaskRequestHandle active = requestHolder.get();
+                    if (active != null) {
+                        active.cancel();
+                    }
                     scheduleDailyShareRetry(classLoader, day, accountKey,
                             attempt, generation, "timeout");
                 }
@@ -869,8 +899,8 @@ public final class HeyBoxModule extends XposedModule {
     }
 
     /** 使用小黑盒原生任务接口和 RxJava 调度读取一次任务列表，不触发任务页面刷新。 */
-    private void requestTaskListOnce(ClassLoader classLoader,
-                                     TaskListCallback callback) throws Throwable {
+    private TaskRequestHandle requestTaskListOnce(ClassLoader classLoader,
+                                                  TaskListCallback callback) throws Throwable {
         Class<?> networkFactory = Class.forName(
                 "com.max.xiaoheihe.network.i", false, classLoader);
         Object service = networkFactory.getMethod("a").invoke(null);
@@ -891,19 +921,21 @@ public final class HeyBoxModule extends XposedModule {
         observable = observable.getClass().getMethod(
                 "a4", schedulerClass).invoke(observable, mainScheduler);
 
-        AtomicBoolean terminal = new AtomicBoolean();
+        TaskRequestHandle request = new TaskRequestHandle();
         Class<?> observerClass = Class.forName("io.reactivex.g0", false, classLoader);
         Object observer = Proxy.newProxyInstance(classLoader,
                 new Class<?>[]{observerClass}, (proxy, method, args) -> {
                     String name = method.getName();
-                    if ("onNext".equals(name) && args != null && args.length > 0) {
-                        if (!terminal.compareAndSet(false, true)) {
+                    if ("onSubscribe".equals(name) && args != null && args.length > 0) {
+                        request.attachDisposable(args[0]);
+                    } else if ("onNext".equals(name) && args != null && args.length > 0) {
+                        if (!request.finish()) {
                             return null;
                         }
                         Object taskResult = unwrapTaskResult(args[0]);
                         mainHandler.post(() -> callback.onResult(taskResult));
                     } else if ("onError".equals(name)) {
-                        if (!terminal.compareAndSet(false, true)) {
+                        if (!request.finish()) {
                             return null;
                         }
                         Throwable error = args != null && args.length > 0
@@ -914,7 +946,7 @@ public final class HeyBoxModule extends XposedModule {
                                 + errorMessage(error);
                         mainHandler.post(() -> callback.onFailure(reason));
                     } else if ("onComplete".equals(name)) {
-                        if (terminal.compareAndSet(false, true)) {
+                        if (request.finish()) {
                             mainHandler.post(() -> callback.onFailure(
                                     "completed_without_result"));
                         }
@@ -929,6 +961,7 @@ public final class HeyBoxModule extends XposedModule {
                 });
         Method subscribe = observable.getClass().getMethod("J5", observerClass);
         subscribe.invoke(observable, observer);
+        return request;
     }
 
     private static Object unwrapTaskResult(Object envelope) {
@@ -949,20 +982,33 @@ public final class HeyBoxModule extends XposedModule {
     private void scheduleDailyShareRetry(ClassLoader classLoader, String day,
                                           String accountKey, int attempt,
                                           long generation, String reason) {
+        TaskRequestHandle request;
+        boolean giveUp;
         synchronized (this) {
             if (!dailyShareFetchRequested
                     || dailyShareRequestGeneration != generation
                     || dailyShareActiveAttempt != attempt) {
                 return;
             }
-            if (attempt >= DAILY_SHARE_MAX_FETCH_ATTEMPTS) {
+            request = dailyShareActiveRequest;
+            dailyShareActiveRequest = null;
+            giveUp = attempt >= DAILY_SHARE_MAX_FETCH_ATTEMPTS;
+            if (giveUp) {
                 dailyShareFetchRequested = false;
                 dailyShareActiveAttempt = 0;
                 dailyShareRequestGeneration++;
-                warn("DAILY_TASK_FETCH_GIVE_UP day=" + day);
-                return;
+                dailyShareSuppressedDay = day;
+                dailyShareSuppressedAccount = accountKey;
+            } else {
+                dailyShareActiveAttempt = attempt + 1;
             }
-            dailyShareActiveAttempt = attempt + 1;
+        }
+        if (request != null) {
+            request.cancel();
+        }
+        if (giveUp) {
+            warn("DAILY_TASK_FETCH_GIVE_UP day=" + day + " reason=" + reason);
+            return;
         }
         warn("DAILY_TASK_FETCH_ERROR attempt=" + attempt + " reason=" + reason);
         mainHandler.postDelayed(
@@ -977,10 +1023,34 @@ public final class HeyBoxModule extends XposedModule {
                 && dailyShareActiveAttempt == attempt;
     }
 
-    private synchronized void invalidateDailyShareRequest() {
-        dailyShareFetchRequested = false;
-        dailyShareActiveAttempt = 0;
-        dailyShareRequestGeneration++;
+    private void invalidateDailyShareRequest() {
+        TaskRequestHandle request;
+        synchronized (this) {
+            request = dailyShareActiveRequest;
+            dailyShareActiveRequest = null;
+            dailyShareFetchRequested = false;
+            dailyShareActiveAttempt = 0;
+            dailyShareRequestGeneration++;
+        }
+        if (request != null) {
+            request.cancel();
+        }
+    }
+
+    private void replaceDailyShareActiveRequest(TaskRequestHandle request,
+                                                long generation, int attempt) {
+        TaskRequestHandle previous;
+        synchronized (this) {
+            if (!isDailyShareRequestActive(generation, attempt)) {
+                request.cancel();
+                return;
+            }
+            previous = dailyShareActiveRequest;
+            dailyShareActiveRequest = request;
+        }
+        if (previous != null && previous != request) {
+            previous.cancel();
+        }
     }
 
     private boolean scheduleDailyShareTasks(Object fragment, Object taskResult,
@@ -1005,9 +1075,21 @@ public final class HeyBoxModule extends XposedModule {
                 warn("DAILY_TASK_SKIP reason=not_logged_in");
                 return false;
             }
-            List<Object> tasks = collectShareTasks(taskResult);
+            TaskCollectionResult collection = collectShareTasks(taskResult);
+            if (!collection.isReliable()) {
+                warn("DAILY_TASK_PARSE_INCOMPATIBLE examined=" + collection.examined
+                        + " failures=" + collection.parseFailures
+                        + " structure=" + collection.structureRecognized);
+                return false;
+            }
+            List<Object> tasks = collection.tasks;
+            synchronized (this) {
+                dailyShareSuppressedDay = "";
+                dailyShareSuppressedAccount = "";
+            }
             if (tasks.isEmpty()) {
-                markDailyShareDay(context, day, accountKey);
+                writeDailyShareState(context, day, accountKey,
+                        DAILY_SHARE_STATE_CONFIRMED, new LinkedHashSet<>());
                 invalidateDailyShareRequest();
                 info("DAILY_TASK_SKIP reason=no_pending_share_task");
                 return true;
@@ -1021,14 +1103,17 @@ public final class HeyBoxModule extends XposedModule {
                 }
                 SharedPreferences runtime = context.getSharedPreferences(
                         DAILY_RUNTIME_PREFS, Context.MODE_PRIVATE);
-                if (day.equals(runtime.getString(dailyShareDateKey(accountKey), ""))) {
+                if (day.equals(runtime.getString(dailyShareDateKey(accountKey), ""))
+                        && DAILY_SHARE_STATE_CONFIRMED.equals(runtime.getString(
+                        dailyShareStateKey(accountKey), ""))) {
                     invalidateDailyShareRequest();
-                    info("DAILY_TASK_SKIP reason=already_run day=" + day);
+                    info("DAILY_TASK_SKIP reason=already_confirmed day=" + day);
                     return true;
                 }
-                // 任务列表已经成功确认且即将执行时就写入日期。这样即使某一项
-                // 上报或后续确认失败，同一天再次打开应用也不会重复领取/重复提示。
-                markDailyShareDay(context, day, accountKey);
+                // 这里只写 IN_PROGRESS。进程中断或服务器未确认时，下一次启动会先
+                // 重新读取服务端，仅处理仍处于 pending 的任务；绝不提前写完成态。
+                writeDailyShareState(context, day, accountKey,
+                        DAILY_SHARE_STATE_IN_PROGRESS, collectTaskKeys(tasks));
                 dailyShareInProgress = true;
             }
 
@@ -1053,17 +1138,51 @@ public final class HeyBoxModule extends XposedModule {
         }
     }
 
-    private void markDailyShareDay(Context context, String day, String accountKey) {
+    private void writeDailyShareState(Context context, String day, String accountKey,
+                                      String state, Set<String> taskKeys) {
         if (context == null || day == null || day.isEmpty()
-                || accountKey == null || accountKey.isEmpty()) {
+                || accountKey == null || accountKey.isEmpty()
+                || state == null || state.isEmpty()) {
             return;
         }
-        context.getSharedPreferences(DAILY_RUNTIME_PREFS, Context.MODE_PRIVATE)
-                .edit().putString(dailyShareDateKey(accountKey), day).apply();
+        SharedPreferences.Editor editor = context.getSharedPreferences(
+                        DAILY_RUNTIME_PREFS, Context.MODE_PRIVATE).edit()
+                .putString(dailyShareDateKey(accountKey), day)
+                .putString(dailyShareStateKey(accountKey), state);
+        if (taskKeys == null || taskKeys.isEmpty()) {
+            editor.remove(dailyShareTasksKey(accountKey));
+        } else {
+            editor.putStringSet(dailyShareTasksKey(accountKey),
+                    new LinkedHashSet<>(taskKeys));
+        }
+        // 每个账号每天最多写入数次，使用同步提交确保进程立即被杀时状态仍可恢复。
+        if (!editor.commit()) {
+            warn("DAILY_TASK_STATE_WRITE_FAILED day=" + day + " state=" + state);
+        }
     }
 
     private static String dailyShareDateKey(String accountKey) {
         return DAILY_SHARE_DATE_PREFIX + accountKey;
+    }
+
+    private static String dailyShareStateKey(String accountKey) {
+        return DAILY_SHARE_STATE_PREFIX + accountKey;
+    }
+
+    private static String dailyShareTasksKey(String accountKey) {
+        return DAILY_SHARE_TASKS_PREFIX + accountKey;
+    }
+
+    private DailyShareRuntimeState readDailyShareState(Context context, String accountKey) {
+        SharedPreferences runtime = context.getSharedPreferences(
+                DAILY_RUNTIME_PREFS, Context.MODE_PRIVATE);
+        String day = runtime.getString(dailyShareDateKey(accountKey), "");
+        String state = runtime.getString(dailyShareStateKey(accountKey), "");
+        Set<String> stored = runtime.getStringSet(dailyShareTasksKey(accountKey), null);
+        // 0.7.5 及更早版本只有日期，没有可信的完成态。把它视为未知状态并重新
+        // 查询服务器；已完成时只产生一次列表请求，不会再次提交分享任务。
+        return new DailyShareRuntimeState(day, state,
+                stored == null ? new LinkedHashSet<>() : new LinkedHashSet<>(stored));
     }
 
     private String resolveDailyAccountKey() {
@@ -1083,7 +1202,7 @@ public final class HeyBoxModule extends XposedModule {
     }
 
     private static String currentDay() {
-        return LocalDate.now().toString();
+        return LocalDate.now(DAILY_TASK_ZONE).toString();
     }
 
     private Context getFragmentContext(Object fragment) {
@@ -1101,10 +1220,11 @@ public final class HeyBoxModule extends XposedModule {
     }
 
     @SuppressWarnings("unchecked")
-    private List<Object> collectShareTasks(Object taskResult) throws Throwable {
-        List<Object> result = new ArrayList<>();
+    private TaskCollectionResult collectShareTasks(Object taskResult) throws Throwable {
+        TaskCollectionResult result = new TaskCollectionResult();
         Method getTaskList = taskResult.getClass().getMethod("getTask_list");
         Object groups = getTaskList.invoke(taskResult);
+        result.structureRecognized = groups == null || groups instanceof List;
         if (groups instanceof List) {
             for (Object group : (List<Object>) groups) {
                 if (group == null) {
@@ -1112,6 +1232,9 @@ public final class HeyBoxModule extends XposedModule {
                 }
                 Method getTasks = group.getClass().getMethod("getTasks");
                 Object taskList = getTasks.invoke(group);
+                if (taskList != null && !(taskList instanceof List)) {
+                    result.structureRecognized = false;
+                }
                 if (taskList instanceof List) {
                     for (Object task : (List<Object>) taskList) {
                         addPendingShareTask(result, task);
@@ -1123,37 +1246,46 @@ public final class HeyBoxModule extends XposedModule {
         // task_list 与 task_lines 是并列区域，不是互斥的。之前只有在
         // task_list 为空时才读取 task_lines，导致常见的“两项在 task_list、
         // 游戏评价在 task_lines”响应被漏掉一项。
+        Method getLines;
         try {
-            Method getLines = taskResult.getClass().getMethod("getTask_lines");
-            Object lines = getLines.invoke(taskResult);
-            if (lines != null) {
-                Method getItems = lines.getClass().getMethod("getTask_line_items");
-                Object items = getItems.invoke(lines);
-                if (items instanceof List) {
-                    for (Object line : (List<Object>) items) {
-                        if (line == null) {
-                            continue;
-                        }
-                        Method getTasks = line.getClass().getMethod("getTasks");
-                        Object taskList = getTasks.invoke(line);
-                        if (taskList instanceof List) {
-                            for (Object task : (List<Object>) taskList) {
-                                addPendingShareTask(result, task);
-                            }
+            getLines = taskResult.getClass().getMethod("getTask_lines");
+        } catch (NoSuchMethodException ignored) {
+            // 旧版本没有 task_lines，已经检查过 task_list。
+            return result;
+        }
+        Object lines = getLines.invoke(taskResult);
+        if (lines != null) {
+            Method getItems = lines.getClass().getMethod("getTask_line_items");
+            Object items = getItems.invoke(lines);
+            if (items != null && !(items instanceof List)) {
+                result.structureRecognized = false;
+            }
+            if (items instanceof List) {
+                for (Object line : (List<Object>) items) {
+                    if (line == null) {
+                        continue;
+                    }
+                    Method getTasks = line.getClass().getMethod("getTasks");
+                    Object taskList = getTasks.invoke(line);
+                    if (taskList != null && !(taskList instanceof List)) {
+                        result.structureRecognized = false;
+                    }
+                    if (taskList instanceof List) {
+                        for (Object task : (List<Object>) taskList) {
+                            addPendingShareTask(result, task);
                         }
                     }
                 }
             }
-        } catch (NoSuchMethodException ignored) {
-            // 旧版本没有 task_lines，已经检查过 task_list。
         }
         return result;
     }
 
-    private void addPendingShareTask(List<Object> result, Object task) {
+    private void addPendingShareTask(TaskCollectionResult result, Object task) {
         if (task == null) {
             return;
         }
+        result.examined++;
         try {
             Method getTitle = task.getClass().getMethod("getTitle");
             Method getType = task.getClass().getMethod("getType");
@@ -1164,13 +1296,25 @@ public final class HeyBoxModule extends XposedModule {
             if (isShareTask(title, type)
                     && !"finish".equalsIgnoreCase(state)
                     && !"can_reward".equalsIgnoreCase(state)
-                    && !containsEquivalentTask(result, task)) {
-                result.add(task);
+                    && !containsEquivalentTask(result.tasks, task)) {
+                result.tasks.add(task);
             }
         } catch (Throwable throwable) {
+            result.parseFailures++;
             warn("DAILY_TASK_READ_ERROR error="
                     + unwrap(throwable).getClass().getSimpleName());
         }
+    }
+
+    private Set<String> collectTaskKeys(List<Object> tasks) {
+        Set<String> keys = new LinkedHashSet<>();
+        for (Object task : tasks) {
+            String key = taskIdentity(task);
+            if (!key.isEmpty()) {
+                keys.add(key);
+            }
+        }
+        return keys;
     }
 
     private boolean containsEquivalentTask(List<Object> tasks, Object candidate) {
@@ -1223,7 +1367,12 @@ public final class HeyBoxModule extends XposedModule {
         try {
             String title = stringValue(task.getClass().getMethod("getTitle").invoke(task));
             String type = stringValue(task.getClass().getMethod("getType").invoke(task));
-            String url = stringValue(task.getClass().getMethod("getUrl").invoke(task));
+            String url = "";
+            try {
+                url = stringValue(task.getClass().getMethod("getUrl").invoke(task));
+            } catch (Throwable ignored) {
+                // 标题与类型在当前任务列表中已经足以稳定区分三个分享任务。
+            }
             return title + "|" + type + "|" + url;
         } catch (Throwable ignored) {
             return "";
@@ -1322,8 +1471,9 @@ public final class HeyBoxModule extends XposedModule {
             return;
         }
         AtomicBoolean responseReceived = new AtomicBoolean();
+        AtomicReference<TaskRequestHandle> requestHolder = new AtomicReference<>();
         try {
-            requestTaskListOnce(classLoader, new TaskListCallback() {
+            TaskRequestHandle request = requestTaskListOnce(classLoader, new TaskListCallback() {
                 @Override
                 public void onResult(Object taskResult) {
                     if (!responseReceived.compareAndSet(false, true)) {
@@ -1342,8 +1492,14 @@ public final class HeyBoxModule extends XposedModule {
                             summary, context, classLoader, attempt, reason);
                 }
             });
+            requestHolder.set(request);
+            summary.replaceActiveRequest(request);
             mainHandler.postDelayed(() -> {
                 if (responseReceived.compareAndSet(false, true)) {
+                    TaskRequestHandle active = requestHolder.get();
+                    if (active != null) {
+                        active.cancel();
+                    }
                     retryOrFinishDailyShareConfirmation(summary, context, classLoader,
                             attempt, "timeout");
                 }
@@ -1364,7 +1520,13 @@ public final class HeyBoxModule extends XposedModule {
                         attempt, "empty_result");
                 return;
             }
-            List<Object> pendingTasks = collectShareTasks(taskResult);
+            TaskCollectionResult collection = collectShareTasks(taskResult);
+            if (!collection.isReliable()) {
+                retryOrFinishDailyShareConfirmation(summary, context, classLoader,
+                        attempt, "parse_incompatible");
+                return;
+            }
+            List<Object> pendingTasks = collection.tasks;
             Set<String> pendingKeys = new LinkedHashSet<>();
             for (Object task : pendingTasks) {
                 String key = taskIdentity(task);
@@ -1498,6 +1660,7 @@ public final class HeyBoxModule extends XposedModule {
                                                      Context context,
                                                      ClassLoader classLoader,
                                                      int attempt, String reason) {
+        summary.cancelActiveRequest();
         if (attempt < DAILY_SHARE_CONFIRM_MAX_ATTEMPTS) {
             warn("DAILY_TASK_CONFIRM_RETRY attempt=" + attempt
                     + " reason=" + reason);
@@ -1510,12 +1673,14 @@ public final class HeyBoxModule extends XposedModule {
     }
 
     private void finishDailyShareConfirmation(DailyShareSummary summary, Context context,
-                                              int confirmed, long exp, long coin,
-                                              int pending, boolean allConfirmed) {
+                                               int confirmed, long exp, long coin,
+                                               int pending, boolean allConfirmed) {
+        summary.cancelActiveRequest();
         dailyShareInProgress = false;
         invalidateDailyShareRequest();
         if (allConfirmed) {
-            markDailyShareDay(context, summary.day, summary.accountKey);
+            writeDailyShareState(context, summary.day, summary.accountKey,
+                    DAILY_SHARE_STATE_CONFIRMED, new LinkedHashSet<>());
         }
         if (confirmed > 0) {
             String message = String.format(Locale.ROOT,
@@ -1541,6 +1706,7 @@ public final class HeyBoxModule extends XposedModule {
 
     private void finishDailyShareConfirmationFailure(DailyShareSummary summary,
                                                      Context context, String reason) {
+        summary.cancelActiveRequest();
         dailyShareInProgress = false;
         invalidateDailyShareRequest();
         warn("DAILY_TASK_CONFIRM_FAILED reason=" + reason);
@@ -1676,6 +1842,84 @@ public final class HeyBoxModule extends XposedModule {
         void onFailure(String reason);
     }
 
+    /** 通过反射持有宿主 RxJava Disposable，超时和状态失效时真正取消订阅。 */
+    private static final class TaskRequestHandle {
+        private final AtomicBoolean terminal = new AtomicBoolean();
+        private final AtomicReference<Object> disposable = new AtomicReference<>();
+
+        void attachDisposable(Object value) {
+            if (value == null) {
+                return;
+            }
+            if (!disposable.compareAndSet(null, value)) {
+                dispose(value);
+                return;
+            }
+            if (terminal.get()) {
+                dispose(disposable.getAndSet(null));
+            }
+        }
+
+        boolean finish() {
+            if (!terminal.compareAndSet(false, true)) {
+                return false;
+            }
+            dispose(disposable.getAndSet(null));
+            return true;
+        }
+
+        void cancel() {
+            terminal.set(true);
+            dispose(disposable.getAndSet(null));
+        }
+
+        private static void dispose(Object value) {
+            if (value == null) {
+                return;
+            }
+            try {
+                Method dispose = value.getClass().getMethod("dispose");
+                dispose.setAccessible(true);
+                dispose.invoke(value);
+            } catch (Throwable ignored) {
+                // 订阅已经终止或宿主 RxJava 接口变化时无需影响主流程。
+            }
+        }
+    }
+
+    private static final class TaskCollectionResult {
+        final List<Object> tasks = new ArrayList<>();
+        int examined;
+        int parseFailures;
+        boolean structureRecognized;
+
+        boolean isReliable() {
+            return structureRecognized && parseFailures == 0;
+        }
+    }
+
+    private static final class DailyShareRuntimeState {
+        final String day;
+        final String state;
+        final Set<String> taskKeys;
+
+        DailyShareRuntimeState(String day, String state, Set<String> taskKeys) {
+            this.day = day == null ? "" : day;
+            this.state = state == null ? "" : state;
+            this.taskKeys = taskKeys;
+        }
+    }
+
+    private static final class HookGroupProgress {
+        final int installed;
+        final int expected;
+
+        HookGroupProgress(int installed, int expected) {
+            this.installed = installed;
+            this.expected = expected;
+        }
+    }
+
     /**
      * WeakHashMap 依赖对象的 equals/hashCode，而 MediaData 会在加载过程中把 URL、
      * 原图地址和状态写回自身，导致 hashCode 改变后无法再命中。查看器图片数量很小，
@@ -1720,6 +1964,62 @@ public final class HeyBoxModule extends XposedModule {
         }
     }
 
+    /** O(1) 弱身份映射：键的 equals/hashCode 变化不会破坏缓存，也不会强持有宿主模型。 */
+    private static final class WeakIdentityMap<K, V> {
+        private final ReferenceQueue<K> queue = new ReferenceQueue<>();
+        private final Map<IdentityWeakReference<K>, V> values = new HashMap<>();
+
+        V get(K key) {
+            if (key == null) {
+                return null;
+            }
+            removeCollectedKeys();
+            return values.get(new IdentityWeakReference<>(key, null));
+        }
+
+        void put(K key, V value) {
+            if (key == null) {
+                return;
+            }
+            removeCollectedKeys();
+            values.put(new IdentityWeakReference<>(key, queue), value);
+        }
+
+        @SuppressWarnings("unchecked")
+        private void removeCollectedKeys() {
+            IdentityWeakReference<K> reference;
+            while ((reference = (IdentityWeakReference<K>) queue.poll()) != null) {
+                values.remove(reference);
+            }
+        }
+    }
+
+    private static final class IdentityWeakReference<T> extends WeakReference<T> {
+        private final int identityHash;
+
+        IdentityWeakReference(T referent, ReferenceQueue<T> queue) {
+            super(referent, queue);
+            identityHash = System.identityHashCode(referent);
+        }
+
+        @Override
+        public int hashCode() {
+            return identityHash;
+        }
+
+        @Override
+        public boolean equals(Object other) {
+            if (this == other) {
+                return true;
+            }
+            if (!(other instanceof IdentityWeakReference<?>)) {
+                return false;
+            }
+            Object mine = get();
+            return mine != null && mine == ((IdentityWeakReference<?>) other).get();
+        }
+    }
+
     private static final class DailyShareRecord {
         final String taskKey;
         final long exp;
@@ -1742,6 +2042,7 @@ public final class HeyBoxModule extends XposedModule {
         long exp;
         long coin;
         boolean repairAttempted;
+        private TaskRequestHandle activeRequest;
 
         DailyShareSummary(int scheduled, String day, String accountKey,
                           Object fragment) {
@@ -1749,6 +2050,22 @@ public final class HeyBoxModule extends XposedModule {
             this.day = day;
             this.accountKey = accountKey;
             this.fragmentReference = new WeakReference<>(fragment);
+        }
+
+        synchronized void replaceActiveRequest(TaskRequestHandle request) {
+            TaskRequestHandle previous = activeRequest;
+            activeRequest = request;
+            if (previous != null && previous != request) {
+                previous.cancel();
+            }
+        }
+
+        synchronized void cancelActiveRequest() {
+            TaskRequestHandle request = activeRequest;
+            activeRequest = null;
+            if (request != null) {
+                request.cancel();
+            }
         }
     }
 
@@ -1833,8 +2150,8 @@ public final class HeyBoxModule extends XposedModule {
             warn("HOOK_SPLASH_FAST_SKIP reason="
                     + unwrap(throwable).getClass().getSimpleName());
         }
+        recordHookProgress("开屏广告", installed, 2);
         if (installed > 0) {
-            recordHookGroup("开屏广告");
             info("HOOK_SPLASH_AD_OK methods=" + installed);
         } else {
             error("HOOK_SPLASH_AD_ERROR",
@@ -1848,7 +2165,9 @@ public final class HeyBoxModule extends XposedModule {
      */
     private void installGlobalAdHooks(ClassLoader classLoader) {
         int installed = 0;
+        int expected = 0;
         if (adCleanHomeSnapshot) {
+            expected += 6;
             int categoryInstalled = 0;
             try {
                 Class<?> mainActivity = Class.forName(MAIN_ACTIVITY, false, classLoader);
@@ -1867,23 +2186,20 @@ public final class HeyBoxModule extends XposedModule {
                 warn("AD_MAIN_HOOK_SKIP reason="
                         + unwrap(throwable).getClass().getSimpleName());
             }
-            categoryInstalled += hookConstantNoArgGetter(classLoader,
-                    "com.max.xiaoheihe.bean.AdsInfosObj", "getInner_ads",
-                    Collections.emptyList());
+            categoryInstalled += hookEmptyListNoArgGetter(classLoader,
+                    "com.max.xiaoheihe.bean.AdsInfosObj", "getInner_ads");
             categoryInstalled += hookConstantNoArgGetter(classLoader,
                     "com.max.xiaoheihe.bean.ads.OverallAdInfo", "getBubble_ad", null);
             categoryInstalled += hookConstantNoArgGetter(classLoader,
                     "com.max.xiaoheihe.bean.ads.OverallAdInfo", "getHome_corner_ad", null);
             installed += categoryInstalled;
-            if (categoryInstalled > 0) {
-                recordHookGroup("广告/首页与页内");
-            }
+            recordHookProgress("广告/首页与页内", categoryInstalled, 6);
         }
 
         if (adCleanFeedSnapshot) {
-            int categoryInstalled = hookConstantNoArgGetter(classLoader,
-                    "com.max.xiaoheihe.bean.bbs.FeedsContentAdObj", "getBanners",
-                    Collections.emptyList());
+            expected += 12;
+            int categoryInstalled = hookEmptyListNoArgGetter(classLoader,
+                    "com.max.xiaoheihe.bean.bbs.FeedsContentAdObj", "getBanners");
             try {
                 Class<?> feedsAd = Class.forName(
                         "com.max.xiaoheihe.bean.bbs.FeedsContentAdObj", false, classLoader);
@@ -1909,12 +2225,11 @@ public final class HeyBoxModule extends XposedModule {
                         + unwrap(throwable).getClass().getSimpleName());
             }
             installed += categoryInstalled;
-            if (categoryInstalled > 0) {
-                recordHookGroup("广告/信息流对象");
-            }
+            recordHookProgress("广告/信息流对象", categoryInstalled, 12);
         }
 
         if (adCleanBannersSnapshot) {
+            expected += 9;
             int categoryInstalled = 0;
             String[][] bannerGetters = {
                     {"com.max.xiaoheihe.bean.bbs.BBSTopicLinksObj", "getBanner"},
@@ -1928,16 +2243,16 @@ public final class HeyBoxModule extends XposedModule {
                     {"com.max.xiaoheihe.bean.mall.MallProductObj", "getBanners"}
             };
             for (String[] target : bannerGetters) {
-                categoryInstalled += hookConstantNoArgGetter(
-                        classLoader, target[0], target[1], Collections.emptyList());
+                categoryInstalled += hookEmptyListNoArgGetter(
+                        classLoader, target[0], target[1]);
             }
             installed += categoryInstalled;
-            if (categoryInstalled > 0) {
-                recordHookGroup("广告/横幅");
-            }
+            recordHookProgress("广告/横幅", categoryInstalled, 9);
         }
 
         if (adCleanMallBottomSnapshot) {
+            expected++;
+            int categoryInstalled = 0;
             try {
                 Class<?> manager = Class.forName(
                         "com.max.xiaoheihe.module.mall.BottomBarManager", false, classLoader);
@@ -1948,18 +2263,22 @@ public final class HeyBoxModule extends XposedModule {
                         false, classLoader);
                 Method showBottomAd = manager.getDeclaredMethod("c", View.class,
                         protocol, Context.class, int.class, notificationType);
+                if (showBottomAd.getReturnType() != void.class) {
+                    throw new NoSuchMethodException("BottomBarManager.c return type is not void");
+                }
                 showBottomAd.setAccessible(true);
                 hook(showBottomAd).intercept(chain -> null);
                 installed++;
-                recordHookGroup("广告/商城底栏");
+                categoryInstalled++;
             } catch (Throwable throwable) {
                 warn("AD_MALL_HOOK_SKIP reason="
                         + unwrap(throwable).getClass().getSimpleName());
             }
+            recordHookProgress("广告/商城底栏", categoryInstalled, 1);
         }
 
+        recordHookProgress("广告净化", installed, expected);
         if (installed > 0) {
-            recordHookGroup("广告净化");
             info("HOOK_GLOBAL_AD_OK methods=" + installed);
         } else {
             warn("HOOK_GLOBAL_AD_EMPTY");
@@ -1971,7 +2290,33 @@ public final class HeyBoxModule extends XposedModule {
         try {
             Class<?> owner = Class.forName(className, false, classLoader);
             Method getter = owner.getMethod(methodName);
+            Class<?> returnType = getter.getReturnType();
+            if (returnType == void.class || returnType.isPrimitive()
+                    || (value != null && !returnType.isInstance(value))) {
+                throw new NoSuchMethodException(className + "." + methodName
+                        + " incompatible return type " + returnType.getName());
+            }
             hook(getter).intercept(chain -> value);
+            return 1;
+        } catch (Throwable throwable) {
+            warn("AD_GETTER_SKIP method=" + className + "." + methodName
+                    + " reason=" + unwrap(throwable).getClass().getSimpleName());
+            return 0;
+        }
+    }
+
+    private int hookEmptyListNoArgGetter(ClassLoader classLoader, String className,
+                                         String methodName) {
+        try {
+            Class<?> owner = Class.forName(className, false, classLoader);
+            Method getter = owner.getMethod(methodName);
+            if (!getter.getReturnType().isAssignableFrom(ArrayList.class)) {
+                throw new NoSuchMethodException(className + "." + methodName
+                        + " cannot accept ArrayList");
+            }
+            // 宿主未来即使对返回列表执行 clear/add，也不会修改共享不可变对象或
+            // 影响其它模型实例。广告 getter 都是低频数据读取，单次空列表分配可接受。
+            hook(getter).intercept(chain -> new ArrayList<>());
             return 1;
         } catch (Throwable throwable) {
             warn("AD_GETTER_SKIP method=" + className + "." + methodName
@@ -1984,6 +2329,10 @@ public final class HeyBoxModule extends XposedModule {
                                  Class<?>... parameterTypes) {
         try {
             Method method = owner.getDeclaredMethod(methodName, parameterTypes);
+            if (method.getReturnType() != void.class) {
+                throw new NoSuchMethodException(owner.getName() + "." + methodName
+                        + " return type is not void");
+            }
             method.setAccessible(true);
             hook(method).intercept(chain -> null);
             return 1;
@@ -2021,37 +2370,57 @@ public final class HeyBoxModule extends XposedModule {
     private static final class FeedFilterCache {
         final Object source;
         final int sourceSize;
+        final long contentStamp;
         final Object filtered;
 
-        FeedFilterCache(Object source, int sourceSize, Object filtered) {
+        FeedFilterCache(Object source, int sourceSize, long contentStamp, Object filtered) {
             this.source = source;
             this.sourceSize = sourceSize;
+            this.contentStamp = contentStamp;
             this.filtered = filtered;
         }
     }
 
+    /** 只使用元素身份生成顺序敏感指纹；对象内部字段变化不影响广告类型判断。 */
+    private static long feedContentStamp(List<?> source) {
+        long stamp = 0xcbf29ce484222325L;
+        for (Object item : source) {
+            stamp ^= item == null ? 0L : System.identityHashCode(item);
+            stamp *= 0x100000001b3L;
+        }
+        return stamp;
+    }
+
     /**
      * 同一个结果对象的 getter 会在 RecyclerView 绑定期间被反复调用。按宿主结果对象
-     * 缓存过滤结果，只有列表实例或长度变化时才重新扫描，避免滑动热路径重复复制。
+     * 缓存过滤结果。列表实例、长度或元素身份/顺序任一变化时重新过滤，避免同一个
+     * List 原位 set 后继续返回旧数据；弱键按身份比较，不依赖可变模型的 hashCode。
      */
     private int hookFilteredFeedGetter(ClassLoader classLoader, String className,
                                        String methodName, Class<?> feedsAdClass) {
         try {
             Class<?> owner = Class.forName(className, false, classLoader);
             Method getter = owner.getMethod(methodName);
-            Map<Object, FeedFilterCache> cache = new WeakHashMap<>();
+            if (!getter.getReturnType().isAssignableFrom(ArrayList.class)) {
+                throw new NoSuchMethodException(className + "." + methodName
+                        + " cannot accept filtered ArrayList");
+            }
+            WeakIdentityMap<Object, FeedFilterCache> cache = new WeakIdentityMap<>();
             hook(getter).intercept(chain -> {
                 Object value = chain.proceed();
                 if (!(value instanceof List<?>)) {
                     return value;
                 }
                 Object model = chain.getThisObject();
-                int sourceSize = ((List<?>) value).size();
+                List<?> source = (List<?>) value;
+                int sourceSize = source.size();
+                long contentStamp = feedContentStamp(source);
                 if (model != null) {
                     synchronized (cache) {
                         FeedFilterCache cached = cache.get(model);
                         if (cached != null && cached.source == value
-                                && cached.sourceSize == sourceSize) {
+                                && cached.sourceSize == sourceSize
+                                && cached.contentStamp == contentStamp) {
                             return cached.filtered;
                         }
                     }
@@ -2067,7 +2436,7 @@ public final class HeyBoxModule extends XposedModule {
                 if (model != null) {
                     synchronized (cache) {
                         cache.put(model, new FeedFilterCache(
-                                value, sourceSize, filtered));
+                                value, sourceSize, contentStamp, filtered));
                     }
                 }
                 return filtered;
@@ -2118,8 +2487,8 @@ public final class HeyBoxModule extends XposedModule {
         } catch (Throwable throwable) {
             error("HOOK_EXTERNAL_BROWSER_ERROR", throwable);
         }
+        recordHookProgress("外部浏览器", installed, 3);
         if (installed > 0) {
-            recordHookGroup("外部浏览器");
             info("HOOK_EXTERNAL_BROWSER_OK methods=" + installed);
         }
     }
@@ -2128,6 +2497,10 @@ public final class HeyBoxModule extends XposedModule {
                                           Class<?>... parameterTypes) {
         try {
             Method method = router.getMethod(methodName, parameterTypes);
+            if (method.getReturnType() != void.class) {
+                throw new NoSuchMethodException(router.getName() + "." + methodName
+                        + " return type is not void");
+            }
             hook(method).intercept(chain -> {
                 Context context = (Context) chain.getArg(0);
                 String url = (String) chain.getArg(1);
@@ -2160,34 +2533,76 @@ public final class HeyBoxModule extends XposedModule {
         try {
             Intent intent = new Intent(Intent.ACTION_VIEW, uri);
             intent.addCategory(Intent.CATEGORY_BROWSABLE);
+            List<ResolveInfo> candidates = context.getPackageManager()
+                    .queryIntentActivities(intent,
+                            android.content.pm.PackageManager.MATCH_DEFAULT_ONLY);
+            List<ResolveInfo> externalCandidates = new ArrayList<>();
+            for (ResolveInfo candidate : candidates) {
+                String candidatePackage = candidate.activityInfo == null
+                        ? "" : candidate.activityInfo.packageName;
+                if (!candidatePackage.isEmpty()
+                        && !TARGET_PACKAGE.equals(candidatePackage)
+                        && !Config.MODULE_PACKAGE.equals(candidatePackage)) {
+                    externalCandidates.add(candidate);
+                }
+            }
+            if (externalCandidates.isEmpty()) {
+                return false;
+            }
+
+            Set<String> browserPackages = new LinkedHashSet<>();
+            Intent browserSelector = Intent.makeMainSelectorActivity(
+                    Intent.ACTION_MAIN, Intent.CATEGORY_APP_BROWSER);
+            for (ResolveInfo browser : context.getPackageManager().queryIntentActivities(
+                    browserSelector, android.content.pm.PackageManager.MATCH_DEFAULT_ONLY)) {
+                if (browser.activityInfo != null) {
+                    browserPackages.add(browser.activityInfo.packageName);
+                }
+            }
+            List<ResolveInfo> browserCandidates = new ArrayList<>();
+            if (!browserPackages.isEmpty()) {
+                for (ResolveInfo candidate : externalCandidates) {
+                    if (browserPackages.contains(candidate.activityInfo.packageName)) {
+                        browserCandidates.add(candidate);
+                    }
+                }
+            }
+            List<ResolveInfo> preferredCandidates = browserCandidates.isEmpty()
+                    ? externalCandidates : browserCandidates;
+
             ResolveInfo resolved = context.getPackageManager().resolveActivity(
                     intent, android.content.pm.PackageManager.MATCH_DEFAULT_ONLY);
             String packageName = resolved == null || resolved.activityInfo == null
                     ? "" : resolved.activityInfo.packageName;
-            if (packageName.isEmpty() || TARGET_PACKAGE.equals(packageName)) {
-                List<ResolveInfo> candidates = context.getPackageManager()
-                        .queryIntentActivities(intent,
-                                android.content.pm.PackageManager.MATCH_DEFAULT_ONLY);
-                packageName = "";
-                for (ResolveInfo candidate : candidates) {
-                    String candidatePackage = candidate.activityInfo == null
-                            ? "" : candidate.activityInfo.packageName;
-                    if (!candidatePackage.isEmpty()
-                            && !TARGET_PACKAGE.equals(candidatePackage)
-                            && !Config.MODULE_PACKAGE.equals(candidatePackage)) {
-                        packageName = candidatePackage;
-                        break;
-                    }
+            ResolveInfo defaultExternal = null;
+            for (ResolveInfo candidate : preferredCandidates) {
+                if (packageName.equals(candidate.activityInfo.packageName)) {
+                    defaultExternal = candidate;
+                    break;
                 }
             }
-            if (packageName.isEmpty() || TARGET_PACKAGE.equals(packageName)) {
-                return false;
+            Intent launchIntent;
+            if (defaultExternal != null) {
+                launchIntent = new Intent(intent).setComponent(new ComponentName(
+                        defaultExternal.activityInfo.packageName,
+                        defaultExternal.activityInfo.name));
+            } else {
+                ArrayList<Intent> explicitIntents = new ArrayList<>();
+                for (ResolveInfo candidate : preferredCandidates) {
+                    explicitIntents.add(new Intent(intent).setComponent(new ComponentName(
+                            candidate.activityInfo.packageName, candidate.activityInfo.name)));
+                }
+                Intent primary = explicitIntents.remove(0);
+                launchIntent = Intent.createChooser(primary, "选择外部浏览器");
+                if (!explicitIntents.isEmpty()) {
+                    launchIntent.putExtra(Intent.EXTRA_INITIAL_INTENTS,
+                            explicitIntents.toArray(new Intent[0]));
+                }
             }
-            intent.setPackage(packageName);
             if (!(context instanceof Activity)) {
-                intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                launchIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
             }
-            context.startActivity(intent);
+            context.startActivity(launchIntent);
             return true;
         } catch (Throwable throwable) {
             warn("EXTERNAL_BROWSER_FALLBACK reason="
@@ -2203,15 +2618,18 @@ public final class HeyBoxModule extends XposedModule {
 
     private void installMediaAutoplayHooks(ClassLoader classLoader) {
         int installed = 0;
+        int expected = 0;
         if (disableVideoAutoplaySnapshot) {
+            expected += 4;
             installed += installRecommendedVideoAutoplayHooks(classLoader);
         }
         if (disableGifAutoplaySnapshot) {
+            expected++;
             installed += installFeedGifAutoplayHook(classLoader);
         }
 
+        recordHookProgress("媒体防自动播放", installed, expected);
         if (installed > 0) {
-            recordHookGroup("媒体防自动播放");
             info("HOOK_MEDIA_AUTOPLAY_OK methods=" + installed);
         } else {
             warn("HOOK_MEDIA_AUTOPLAY_EMPTY");
@@ -2282,9 +2700,7 @@ public final class HeyBoxModule extends XposedModule {
                     + unwrap(throwable).getClass().getSimpleName());
         }
 
-        if (installed > 0) {
-            recordHookGroup("媒体/推荐视频");
-        }
+        recordHookProgress("媒体/推荐视频", installed, 4);
         return installed;
     }
 
@@ -2321,9 +2737,10 @@ public final class HeyBoxModule extends XposedModule {
                 }
                 return chain.proceed(arguments);
             });
-            recordHookGroup("媒体/GIF列表");
+            recordHookProgress("媒体/GIF列表", 1, 1);
             return 1;
         } catch (Throwable throwable) {
+            recordHookProgress("媒体/GIF列表", 0, 1);
             warn("MEDIA_GIF_HOOK_SKIP reason="
                     + unwrap(throwable).getClass().getSimpleName());
             return 0;
@@ -2353,31 +2770,12 @@ public final class HeyBoxModule extends XposedModule {
     /**
      * 阻止返回首页后的自动刷新，同时保留手动下拉刷新。
      *
-     * <p>目标版本有两条独立路径：再次点击已选中的首页会发送 gotop 广播；从其他
-     * 底部页面返回时，NewsTagListFragment.onHiddenChanged(false) 会在离开超过
-     * 180 秒后同步调用 D3()。后者正是“待一段时间后回来才刷新”的实际来源。</p>
+     * <p>只处理从其它底部页面返回时，NewsTagListFragment.onHiddenChanged(false)
+     * 在离开超过 180 秒后同步调用 D3() 的路径。再次主动点击已选中的首页所发送的
+     * gotop 广播保持原样，因此用户仍可通过再次点击首页回到顶部。</p>
      */
     private void installHomeReturnRefreshHook(ClassLoader classLoader) {
         int installed = 0;
-        try {
-            Class<?> receiverClass = Class.forName(
-                    "com.max.xiaoheihe.module.news.DiscoveryFragment$NewMsgBroadcastReceiver",
-                    false, classLoader);
-            Method onReceive = receiverClass.getMethod(
-                    "onReceive", Context.class, Intent.class);
-            hook(onReceive).intercept(chain -> {
-                Intent intent = (Intent) chain.getArg(1);
-                if (intent != null && HOME_GO_TOP_ACTION.equals(intent.getAction())) {
-                    return null;
-                }
-                return chain.proceed();
-            });
-            installed++;
-        } catch (Throwable throwable) {
-            warn("HOME_GO_TOP_HOOK_SKIP reason="
-                    + unwrap(throwable).getClass().getSimpleName());
-        }
-
         try {
             Class<?> newsTagList = Class.forName(
                     "com.max.xiaoheihe.module.news.NewsTagListFragment",
@@ -2396,17 +2794,18 @@ public final class HeyBoxModule extends XposedModule {
                     suppressHomeVisibilityRefresh.remove();
                 }
             });
+            installed++;
             hook(autoRefresh).intercept(chain ->
                     Boolean.TRUE.equals(suppressHomeVisibilityRefresh.get())
                             ? null : chain.proceed());
-            installed += 2;
+            installed++;
         } catch (Throwable throwable) {
             warn("HOME_STALE_VISIBILITY_HOOK_SKIP reason="
                     + unwrap(throwable).getClass().getSimpleName());
         }
 
+        recordHookProgress("阻止返回首页自动刷新", installed, 2);
         if (installed > 0) {
-            recordHookGroup("阻止返回首页自动刷新");
             info("HOOK_HOME_RETURN_REFRESH_OK methods=" + installed
                     + " stale=NewsTagListFragment.onHiddenChanged");
         } else {
@@ -2748,11 +3147,6 @@ public final class HeyBoxModule extends XposedModule {
                         public String getSelfCheckReport() {
                             return buildEmbeddedSelfCheckReport();
                         }
-
-                        @Override
-                        public void requestVersionCheck() {
-                            requestVersionCheckFromSettings(activity);
-                        }
                     });
             dialog.show();
             info("SETTINGS_OPEN_OK mode=host_dialog");
@@ -2769,26 +3163,47 @@ public final class HeyBoxModule extends XposedModule {
         synchronized (installedHookGroups) {
             installed = new LinkedHashSet<>(installedHookGroups);
         }
+        Map<String, HookGroupProgress> progress;
+        synchronized (hookGroupProgress) {
+            progress = new LinkedHashMap<>(hookGroupProgress);
+        }
         Set<String> runtimeFailures;
         synchronized (runtimeHookFailures) {
             runtimeFailures = new LinkedHashSet<>(runtimeHookFailures);
         }
         List<String> missing = new ArrayList<>();
+        List<String> partial = new ArrayList<>();
         for (String expected : expectedHookGroups()) {
-            if (!installed.contains(expected)) {
+            HookGroupProgress group = progress.get(expected);
+            if (group != null && group.installed == 0) {
+                missing.add(expected + " 0/" + group.expected);
+            } else if (group != null && group.installed < group.expected) {
+                partial.add(expected + " " + group.installed + "/" + group.expected);
+            } else if (group == null && !installed.contains(expected)) {
                 missing.add(expected);
             }
         }
         String enabled = enabledFeatureSummary();
-        boolean healthy = missing.isEmpty() && runtimeFailures.isEmpty();
+        boolean healthy = missing.isEmpty() && partial.isEmpty()
+                && runtimeFailures.isEmpty();
+        List<String> progressDetails = new ArrayList<>();
+        for (Map.Entry<String, HookGroupProgress> entry : progress.entrySet()) {
+            HookGroupProgress value = entry.getValue();
+            progressDetails.add(entry.getKey() + " " + value.installed
+                    + "/" + value.expected);
+        }
         return "Hook 状态  " + (healthy ? "安装完整" : "部分功能异常")
                 + "\n模块版本  " + MODULE_VERSION
                 + "\n目标版本  " + readTargetVersion(targetContext)
                 + "\n目标进程  " + currentProcessName
                 + "\n已安装组  " + (installed.isEmpty()
                 ? "无" : String.join("、", installed))
+                + "\n安装计数  " + (progressDetails.isEmpty()
+                ? "无" : String.join("、", progressDetails))
                 + "\n缺失组  " + (missing.isEmpty()
                 ? "无" : String.join("、", missing))
+                + "\n部分安装  " + (partial.isEmpty()
+                ? "无" : String.join("、", partial))
                 + "\n运行期回退  " + (runtimeFailures.isEmpty()
                 ? "无" : String.join("、", runtimeFailures))
                 + "\n本次进程已启用  " + (enabled.isEmpty() ? "无" : enabled);
@@ -2861,22 +3276,9 @@ public final class HeyBoxModule extends XposedModule {
         if (postTextSelectSnapshot) {
             expected.add("帖子正文文字选择");
         }
-        if (spoofVersionSnapshot) {
-            expected.add("版本检测");
-            expected.add("版本响应");
-            expected.add("网络版本参数");
-            if (versionIdentityOverrideSnapshot) {
-                expected.add("版本伪装");
-                expected.add("版本Code读取");
-                expected.add("PackageInfo版本");
-            }
-        } else if (suppressUpdatePromptSnapshot) {
-            expected.add("版本响应");
-        }
         if (suppressUpdatePromptSnapshot) {
+            expected.add("更新响应");
             expected.add("更新弹窗");
-            expected.add("更新弹窗/v");
-            expected.add("更新弹窗/w");
         }
         return expected;
     }
@@ -2903,7 +3305,64 @@ public final class HeyBoxModule extends XposedModule {
         return Enum.valueOf((Class<? extends Enum>) enumClass.asSubclass(Enum.class), name);
     }
 
-    /** 伪装应用自身的版本读取和请求参数，不改动系统中其他应用的信息。 */
+    /** 当前版本兼容区只保留更新提示抑制，不安装任何版本身份或诊断请求 Hook。 */
+    private void installUpdateSuppressionHooks(ClassLoader classLoader) {
+        installUpdateResponseSuppression(classLoader);
+        installUpdatePromptHooks(classLoader);
+    }
+
+    private void installUpdateResponseSuppression(ClassLoader classLoader) {
+        int installed = 0;
+        final int expected = 2;
+        try {
+            Class<?> versionObject = Class.forName(
+                    CHECK_VERSION_OBJECT, false, classLoader);
+            Method getNeedUpdate = versionObject.getMethod("getNeed_update");
+            Class<?> returnType = getNeedUpdate.getReturnType();
+            final Object noUpdate;
+            if (returnType == String.class) {
+                noUpdate = "0";
+            } else if (returnType == int.class || returnType == Integer.class) {
+                noUpdate = 0;
+            } else if (returnType == boolean.class || returnType == Boolean.class) {
+                noUpdate = false;
+            } else {
+                throw new NoSuchMethodException(
+                        "CheckVersionObj.getNeed_update unsupported return type");
+            }
+            hook(getNeedUpdate).intercept(chain -> noUpdate);
+            installed++;
+        } catch (Throwable throwable) {
+            warn("HOOK_UPDATE_RESPONSE_SKIP method=getNeed_update reason="
+                    + unwrap(throwable).getClass().getSimpleName());
+        }
+
+        try {
+            Class<?> callbackClass = Class.forName(
+                    "com.max.xiaoheihe.utils.AppUpdateManager$i", false, classLoader);
+            Class<?> networkCallback = Class.forName(
+                    "com.max.hbcommon.network.d", false, classLoader);
+            Method onError = networkCallback.getMethod("onError", Throwable.class);
+            if (onError.getReturnType() != void.class) {
+                throw new NoSuchMethodException("network.d.onError return type is not void");
+            }
+            hook(onError).intercept(chain -> {
+                if (callbackClass.isInstance(chain.getThisObject())) {
+                    info("UPDATE_RESPONSE_ERROR_SUPPRESSED");
+                    return null;
+                }
+                return chain.proceed();
+            });
+            installed++;
+        } catch (Throwable throwable) {
+            warn("HOOK_UPDATE_RESPONSE_SKIP method=onError reason="
+                    + unwrap(throwable).getClass().getSimpleName());
+        }
+        recordHookProgress("更新响应", installed, expected);
+        info("HOOK_UPDATE_RESPONSE_READY methods=" + installed);
+    }
+
+    /** 伪装应用自身的版本读取和请求参数；当前没有入口调用，保留供以后重新设计。 */
     private void installVersionSpoofHooks(ClassLoader classLoader) {
         if (spoofVersionSnapshot) {
             prepareVersionCheck(classLoader);
@@ -3196,8 +3655,8 @@ public final class HeyBoxModule extends XposedModule {
         } catch (Throwable throwable) {
             error("HOOK_UPDATE_PROMPT_ERROR", throwable);
         }
+        recordHookProgress("更新弹窗", installed, 4);
         if (installed > 0) {
-            recordHookGroup("更新弹窗");
             info("HOOK_UPDATE_PROMPT_OK methods=" + installed);
         }
     }
@@ -3206,6 +3665,10 @@ public final class HeyBoxModule extends XposedModule {
                                        Class<?>... parameterTypes) {
         try {
             Method method = updateManager.getDeclaredMethod(methodName, parameterTypes);
+            if (method.getReturnType() != void.class) {
+                throw new NoSuchMethodException("AppUpdateManager." + methodName
+                        + " return type is not void");
+            }
             method.setAccessible(true);
             hook(method).intercept(chain -> {
                 info("UPDATE_PROMPT_SUPPRESSED method=AppUpdateManager." + methodName);
@@ -3652,16 +4115,10 @@ public final class HeyBoxModule extends XposedModule {
         postTextSelectSnapshot = isEnabled(Config.KEY_POST_TEXT_SELECT, false);
         suppressUpdatePromptSnapshot = isEnabled(
                 Config.KEY_SUPPRESS_UPDATE_PROMPT, false);
-        spoofVersionSnapshot = isEnabled(Config.KEY_SPOOF_VERSION, false);
-        versionModeSnapshot = getPreferenceString(
-                Config.KEY_VERSION_MODE, Config.VERSION_MODE_AUTO);
-        customVersionSnapshot = getPreferenceString(Config.KEY_CUSTOM_VERSION, "").trim();
-        customVersionCodeSnapshot = getPreferenceLong(Config.KEY_CUSTOM_VERSION_CODE, 0L);
-        cachedLatestVersionSnapshot = getPreferenceString(
-                Config.KEY_LATEST_VERSION, "").trim();
-        cachedLatestVersionCodeSnapshot = getPreferenceLong(
-                Config.KEY_LATEST_VERSION_CODE, 0L);
-        refreshEffectiveVersionSnapshot();
+        // 版本伪装、在线版本获取和主动版本检测暂时停止提供。即使旧配置仍然
+        // 留有开关，本版本也不会安装版本身份或网络请求热路径 Hook。
+        spoofVersionSnapshot = false;
+        versionIdentityOverrideSnapshot = false;
         info("FEATURE_CONFIG_READY hide_publish=" + hidePublishSnapshot
                 + " share=" + shareTaskSnapshot
                 + " daily_share=" + dailyShareTaskSnapshot
@@ -4032,6 +4489,17 @@ public final class HeyBoxModule extends XposedModule {
         }
     }
 
+    private void recordHookProgress(String group, int installed, int expected) {
+        HookGroupProgress progress = new HookGroupProgress(
+                Math.max(0, installed), Math.max(1, expected));
+        synchronized (hookGroupProgress) {
+            hookGroupProgress.put(group, progress);
+        }
+        if (installed > 0) {
+            recordHookGroup(group);
+        }
+    }
+
     /** 热路径结构变化时只记录一次并回退宿主原逻辑，避免日志风暴。 */
     private void recordRuntimeFallback(String hook, Throwable throwable) {
         Throwable cause = unwrap(throwable);
@@ -4109,9 +4577,6 @@ public final class HeyBoxModule extends XposedModule {
         }
         if (postTextSelectSnapshot) {
             enabled.add("帖子正文文字选择");
-        }
-        if (spoofVersionSnapshot) {
-            enabled.add("版本伪装");
         }
         if (suppressUpdatePromptSnapshot) {
             enabled.add("屏蔽更新弹窗");
