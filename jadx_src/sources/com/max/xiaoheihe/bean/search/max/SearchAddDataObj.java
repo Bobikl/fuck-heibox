@@ -1,0 +1,88 @@
+package com.max.xiaoheihe.bean.search.max;
+
+import androidx.compose.runtime.internal.o;
+import com.meituan.robust.ChangeQuickRedirect;
+import com.meituan.robust.PatchProxy;
+import com.meituan.robust.PatchProxyResult;
+import dl.d;
+import dl.e;
+import java.io.Serializable;
+import kotlin.jvm.internal.f0;
+
+/* JADX INFO: compiled from: SearchAddDataObj.kt */
+/* JADX INFO: loaded from: classes3.dex */
+@o(parameters = 0)
+public final class SearchAddDataObj implements Serializable {
+    public static final int $stable = 8;
+    public static ChangeQuickRedirect changeQuickRedirect;
+
+    @e
+    private String protocol;
+
+    public SearchAddDataObj(@e String str) {
+        this.protocol = str;
+    }
+
+    public static /* synthetic */ SearchAddDataObj copy$default(SearchAddDataObj searchAddDataObj, String str, int i10, Object obj) {
+        PatchProxyResult patchProxyResultProxy = PatchProxy.proxy(new Object[]{searchAddDataObj, str, new Integer(i10), obj}, null, changeQuickRedirect, true, 15883, new Class[]{SearchAddDataObj.class, String.class, Integer.TYPE, Object.class}, SearchAddDataObj.class);
+        if (patchProxyResultProxy.isSupported) {
+            return (SearchAddDataObj) patchProxyResultProxy.result;
+        }
+        if ((i10 & 1) != 0) {
+            str = searchAddDataObj.protocol;
+        }
+        return searchAddDataObj.copy(str);
+    }
+
+    @e
+    public final String component1() {
+        return this.protocol;
+    }
+
+    @d
+    public final SearchAddDataObj copy(@e String str) {
+        PatchProxyResult patchProxyResultProxy = PatchProxy.proxy(new Object[]{str}, this, changeQuickRedirect, false, 15882, new Class[]{String.class}, SearchAddDataObj.class);
+        return patchProxyResultProxy.isSupported ? (SearchAddDataObj) patchProxyResultProxy.result : new SearchAddDataObj(str);
+    }
+
+    public boolean equals(@e Object obj) {
+        PatchProxyResult patchProxyResultProxy = PatchProxy.proxy(new Object[]{obj}, this, changeQuickRedirect, false, 15886, new Class[]{Object.class}, Boolean.TYPE);
+        if (patchProxyResultProxy.isSupported) {
+            return ((Boolean) patchProxyResultProxy.result).booleanValue();
+        }
+        if (this == obj) {
+            return true;
+        }
+        return (obj instanceof SearchAddDataObj) && f0.g(this.protocol, ((SearchAddDataObj) obj).protocol);
+    }
+
+    @e
+    public final String getProtocol() {
+        return this.protocol;
+    }
+
+    public int hashCode() {
+        PatchProxyResult patchProxyResultProxy = PatchProxy.proxy(new Object[0], this, changeQuickRedirect, false, 15885, new Class[0], Integer.TYPE);
+        if (patchProxyResultProxy.isSupported) {
+            return ((Integer) patchProxyResultProxy.result).intValue();
+        }
+        String str = this.protocol;
+        if (str == null) {
+            return 0;
+        }
+        return str.hashCode();
+    }
+
+    public final void setProtocol(@e String str) {
+        this.protocol = str;
+    }
+
+    @d
+    public String toString() {
+        PatchProxyResult patchProxyResultProxy = PatchProxy.proxy(new Object[0], this, changeQuickRedirect, false, 15884, new Class[0], String.class);
+        if (patchProxyResultProxy.isSupported) {
+            return (String) patchProxyResultProxy.result;
+        }
+        return "SearchAddDataObj(protocol=" + this.protocol + ')';
+    }
+}

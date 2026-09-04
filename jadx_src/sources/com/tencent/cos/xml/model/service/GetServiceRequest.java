@@ -1,0 +1,33 @@
+package com.tencent.cos.xml.model.service;
+
+import com.tencent.cos.xml.CosXmlServiceConfig;
+import com.tencent.cos.xml.exception.CosXmlClientException;
+import com.tencent.cos.xml.model.CosXmlRequest;
+import com.tencent.qcloud.core.http.RequestBodySerializer;
+
+/* JADX INFO: loaded from: classes4.dex */
+public final class GetServiceRequest extends CosXmlRequest {
+    @Override // com.tencent.cos.xml.model.CosXmlRequest
+    public void checkParameters() throws CosXmlClientException {
+    }
+
+    @Override // com.tencent.cos.xml.model.CosXmlRequest
+    public String getMethod() {
+        return "GET";
+    }
+
+    @Override // com.tencent.cos.xml.model.CosXmlRequest
+    public String getPath(CosXmlServiceConfig cosXmlServiceConfig) {
+        return "/";
+    }
+
+    @Override // com.tencent.cos.xml.model.CosXmlRequest
+    public RequestBodySerializer getRequestBody() {
+        return null;
+    }
+
+    @Override // com.tencent.cos.xml.model.CosXmlRequest
+    public String getRequestHost(CosXmlServiceConfig cosXmlServiceConfig) {
+        return "service.cos.myqcloud.com";
+    }
+}

@@ -1,0 +1,91 @@
+package df;
+
+import android.view.LayoutInflater;
+import android.view.View;
+import android.view.ViewGroup;
+import android.widget.ImageView;
+import android.widget.LinearLayout;
+import androidx.cardview.widget.CardView;
+import com.max.xiaoheihe.R;
+import com.meituan.robust.ChangeQuickRedirect;
+import com.meituan.robust.PatchProxy;
+import com.meituan.robust.PatchProxyResult;
+
+/* JADX INFO: compiled from: LayoutGameImgBinding.java */
+/* JADX INFO: loaded from: classes3.dex */
+public final class k60 implements l3.c {
+    public static ChangeQuickRedirect changeQuickRedirect;
+
+    /* JADX INFO: renamed from: a, reason: collision with root package name */
+    @androidx.annotation.n0
+    private final CardView f112449a;
+
+    /* JADX INFO: renamed from: b, reason: collision with root package name */
+    @androidx.annotation.n0
+    public final CardView f112450b;
+
+    /* JADX INFO: renamed from: c, reason: collision with root package name */
+    @androidx.annotation.n0
+    public final ImageView f112451c;
+
+    /* JADX INFO: renamed from: d, reason: collision with root package name */
+    @androidx.annotation.n0
+    public final LinearLayout f112452d;
+
+    private k60(@androidx.annotation.n0 CardView cardView, @androidx.annotation.n0 CardView cardView2, @androidx.annotation.n0 ImageView imageView, @androidx.annotation.n0 LinearLayout linearLayout) {
+        this.f112449a = cardView;
+        this.f112450b = cardView2;
+        this.f112451c = imageView;
+        this.f112452d = linearLayout;
+    }
+
+    @androidx.annotation.n0
+    public static k60 a(@androidx.annotation.n0 View view) {
+        PatchProxyResult patchProxyResultProxy = PatchProxy.proxy(new Object[]{view}, null, changeQuickRedirect, true, 20736, new Class[]{View.class}, k60.class);
+        if (patchProxyResultProxy.isSupported) {
+            return (k60) patchProxyResultProxy.result;
+        }
+        CardView cardView = (CardView) view;
+        int i10 = R.id.iv_game_img;
+        ImageView imageView = (ImageView) l3.d.a(view, R.id.iv_game_img);
+        if (imageView != null) {
+            i10 = R.id.vg_is_owned;
+            LinearLayout linearLayout = (LinearLayout) l3.d.a(view, R.id.vg_is_owned);
+            if (linearLayout != null) {
+                return new k60(cardView, cardView, imageView, linearLayout);
+            }
+        }
+        throw new NullPointerException("Missing required view with ID: ".concat(view.getResources().getResourceName(i10)));
+    }
+
+    @androidx.annotation.n0
+    public static k60 c(@androidx.annotation.n0 LayoutInflater layoutInflater) {
+        PatchProxyResult patchProxyResultProxy = PatchProxy.proxy(new Object[]{layoutInflater}, null, changeQuickRedirect, true, 20734, new Class[]{LayoutInflater.class}, k60.class);
+        return patchProxyResultProxy.isSupported ? (k60) patchProxyResultProxy.result : d(layoutInflater, null, false);
+    }
+
+    @androidx.annotation.n0
+    public static k60 d(@androidx.annotation.n0 LayoutInflater layoutInflater, @androidx.annotation.p0 ViewGroup viewGroup, boolean z10) {
+        PatchProxyResult patchProxyResultProxy = PatchProxy.proxy(new Object[]{layoutInflater, viewGroup, new Byte(z10 ? (byte) 1 : (byte) 0)}, null, changeQuickRedirect, true, 20735, new Class[]{LayoutInflater.class, ViewGroup.class, Boolean.TYPE}, k60.class);
+        if (patchProxyResultProxy.isSupported) {
+            return (k60) patchProxyResultProxy.result;
+        }
+        View viewInflate = layoutInflater.inflate(R.layout.layout_game_img, viewGroup, false);
+        if (z10) {
+            viewGroup.addView(viewInflate);
+        }
+        return a(viewInflate);
+    }
+
+    @androidx.annotation.n0
+    public CardView b() {
+        return this.f112449a;
+    }
+
+    @Override // l3.c
+    @androidx.annotation.n0
+    public /* bridge */ /* synthetic */ View getRoot() {
+        PatchProxyResult patchProxyResultProxy = PatchProxy.proxy(new Object[0], this, changeQuickRedirect, false, 20737, new Class[0], View.class);
+        return patchProxyResultProxy.isSupported ? (View) patchProxyResultProxy.result : b();
+    }
+}

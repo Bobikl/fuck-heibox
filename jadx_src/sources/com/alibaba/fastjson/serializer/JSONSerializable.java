@@ -1,0 +1,9 @@
+package com.alibaba.fastjson.serializer;
+
+import java.io.IOException;
+import java.lang.reflect.Type;
+
+/* JADX INFO: loaded from: classes6.dex */
+public interface JSONSerializable {
+    void write(JSONSerializer jSONSerializer, Object obj, Type type, int i10) throws IOException;
+}

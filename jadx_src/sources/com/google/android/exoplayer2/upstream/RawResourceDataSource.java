@@ -1,0 +1,288 @@
+package com.google.android.exoplayer2.upstream;
+
+import android.content.Context;
+import android.content.res.AssetFileDescriptor;
+import android.content.res.Resources;
+import android.net.Uri;
+import android.text.TextUtils;
+import java.io.EOFException;
+import java.io.FileInputStream;
+import java.io.IOException;
+import java.io.InputStream;
+import java.nio.channels.FileChannel;
+
+/* JADX INFO: loaded from: classes7.dex */
+public final class RawResourceDataSource extends f {
+
+    /* JADX INFO: renamed from: m, reason: collision with root package name */
+    public static final String f50908m = "rawresource";
+
+    /* JADX INFO: renamed from: f, reason: collision with root package name */
+    private final Resources f50909f;
+
+    /* JADX INFO: renamed from: g, reason: collision with root package name */
+    private final String f50910g;
+
+    /* JADX INFO: renamed from: h, reason: collision with root package name */
+    @androidx.annotation.p0
+    private Uri f50911h;
+
+    /* JADX INFO: renamed from: i, reason: collision with root package name */
+    @androidx.annotation.p0
+    private AssetFileDescriptor f50912i;
+
+    /* JADX INFO: renamed from: j, reason: collision with root package name */
+    @androidx.annotation.p0
+    private InputStream f50913j;
+
+    /* JADX INFO: renamed from: k, reason: collision with root package name */
+    private long f50914k;
+
+    /* JADX INFO: renamed from: l, reason: collision with root package name */
+    private boolean f50915l;
+
+    public static class RawResourceDataSourceException extends DataSourceException {
+        @Deprecated
+        public RawResourceDataSourceException(String str) {
+            super(str, null, 2000);
+        }
+
+        public RawResourceDataSourceException(@androidx.annotation.p0 String str, @androidx.annotation.p0 Throwable th2, int i10) {
+            super(str, th2, i10);
+        }
+
+        @Deprecated
+        public RawResourceDataSourceException(Throwable th2) {
+            super(th2, 2000);
+        }
+    }
+
+    public RawResourceDataSource(Context context) {
+        super(false);
+        this.f50909f = context.getResources();
+        this.f50910g = context.getPackageName();
+    }
+
+    public static Uri buildRawResourceUri(int i10) {
+        StringBuilder sb2 = new StringBuilder(26);
+        sb2.append("rawresource:///");
+        sb2.append(i10);
+        return Uri.parse(sb2.toString());
+    }
+
+    @Override // com.google.android.exoplayer2.upstream.o
+    public long a(r rVar) throws RawResourceDataSourceException {
+        int identifier;
+        Uri uri = rVar.f51194a;
+        this.f50911h = uri;
+        if (TextUtils.equals(f50908m, uri.getScheme()) || (TextUtils.equals("android.resource", uri.getScheme()) && uri.getPathSegments().size() == 1 && ((String) com.google.android.exoplayer2.util.a.g(uri.getLastPathSegment())).matches("\\d+"))) {
+            try {
+                identifier = Integer.parseInt((String) com.google.android.exoplayer2.util.a.g(uri.getLastPathSegment()));
+            } catch (NumberFormatException unused) {
+                throw new RawResourceDataSourceException("Resource identifier must be an integer.", null, 1004);
+            }
+        } else {
+            if (!TextUtils.equals("android.resource", uri.getScheme())) {
+                throw new RawResourceDataSourceException("URI must either use scheme rawresource or android.resource", null, 1004);
+            }
+            String strSubstring = (String) com.google.android.exoplayer2.util.a.g(uri.getPath());
+            if (strSubstring.startsWith("/")) {
+                strSubstring = strSubstring.substring(1);
+            }
+            String host = uri.getHost();
+            String strValueOf = String.valueOf(TextUtils.isEmpty(host) ? "" : String.valueOf(host).concat(":"));
+            String strValueOf2 = String.valueOf(strSubstring);
+            identifier = this.f50909f.getIdentifier(strValueOf2.length() != 0 ? strValueOf.concat(strValueOf2) : new String(strValueOf), "raw", this.f50910g);
+            if (identifier == 0) {
+                throw new RawResourceDataSourceException("Resource not found.", null, 2005);
+            }
+        }
+        y(rVar);
+        try {
+            AssetFileDescriptor assetFileDescriptorOpenRawResourceFd = this.f50909f.openRawResourceFd(identifier);
+            this.f50912i = assetFileDescriptorOpenRawResourceFd;
+            if (assetFileDescriptorOpenRawResourceFd == null) {
+                String strValueOf3 = String.valueOf(uri);
+                StringBuilder sb2 = new StringBuilder(strValueOf3.length() + 24);
+                sb2.append("Resource is compressed: ");
+                sb2.append(strValueOf3);
+                throw new RawResourceDataSourceException(sb2.toString(), null, 2000);
+            }
+            long length = assetFileDescriptorOpenRawResourceFd.getLength();
+            FileInputStream fileInputStream = new FileInputStream(assetFileDescriptorOpenRawResourceFd.getFileDescriptor());
+            this.f50913j = fileInputStream;
+            if (length != -1) {
+                try {
+                    if (rVar.f51200g > length) {
+                        throw new RawResourceDataSourceException(null, null, 2008);
+                    }
+                } catch (RawResourceDataSourceException e10) {
+                    throw e10;
+                } catch (IOException e11) {
+                    throw new RawResourceDataSourceException(null, e11, 2000);
+                }
+            }
+            long startOffset = assetFileDescriptorOpenRawResourceFd.getStartOffset();
+            long jSkip = fileInputStream.skip(rVar.f51200g + startOffset) - startOffset;
+            if (jSkip != rVar.f51200g) {
+                throw new RawResourceDataSourceException(null, null, 2008);
+            }
+            if (length == -1) {
+                FileChannel channel = fileInputStream.getChannel();
+                if (channel.size() == 0) {
+                    this.f50914k = -1L;
+                } else {
+                    long size = channel.size() - channel.position();
+                    this.f50914k = size;
+                    if (size < 0) {
+                        throw new RawResourceDataSourceException(null, null, 2008);
+                    }
+                }
+            } else {
+                long j10 = length - jSkip;
+                this.f50914k = j10;
+                if (j10 < 0) {
+                    throw new DataSourceException(2008);
+                }
+            }
+            long jMin = rVar.f51201h;
+            if (jMin != -1) {
+                long j11 = this.f50914k;
+                if (j11 != -1) {
+                    jMin = Math.min(j11, jMin);
+                }
+                this.f50914k = jMin;
+            }
+            this.f50915l = true;
+            z(rVar);
+            long j12 = rVar.f51201h;
+            return j12 != -1 ? j12 : this.f50914k;
+        } catch (Resources.NotFoundException e12) {
+            throw new RawResourceDataSourceException(null, e12, 2005);
+        }
+    }
+
+    /* JADX WARN: Bottom block not found for handler: all -> 0x0037 */
+    /* JADX WARN: Bottom block not found for handler: all -> 0x0055 */
+    @Override // com.google.android.exoplayer2.upstream.o
+    /*
+        Code decompiled incorrectly, please refer to instructions dump.
+        To view partially-correct add '--show-bad-code' argument
+    */
+    public void close() throws com.google.android.exoplayer2.upstream.RawResourceDataSource.RawResourceDataSourceException {
+        /*
+            r5 = this;
+            r0 = 0
+            r5.f50911h = r0
+            r1 = 2000(0x7d0, float:2.803E-42)
+            r2 = 0
+            java.io.InputStream r3 = r5.f50913j     // Catch: java.lang.Throwable -> L37 java.io.IOException -> L39
+            if (r3 == 0) goto Ld
+            r3.close()     // Catch: java.lang.Throwable -> L37 java.io.IOException -> L39
+        Ld:
+            r5.f50913j = r0
+            android.content.res.AssetFileDescriptor r3 = r5.f50912i     // Catch: java.lang.Throwable -> L22 java.io.IOException -> L24
+            if (r3 == 0) goto L16
+            r3.close()     // Catch: java.lang.Throwable -> L22 java.io.IOException -> L24
+        L16:
+            r5.f50912i = r0
+            boolean r0 = r5.f50915l
+            if (r0 == 0) goto L21
+            r5.f50915l = r2
+            r5.x()
+        L21:
+            return
+        L22:
+            r1 = move-exception
+            goto L2b
+        L24:
+            r3 = move-exception
+            com.google.android.exoplayer2.upstream.RawResourceDataSource$RawResourceDataSourceException r4 = new com.google.android.exoplayer2.upstream.RawResourceDataSource$RawResourceDataSourceException     // Catch: java.lang.Throwable -> L22
+            r4.<init>(r0, r3, r1)     // Catch: java.lang.Throwable -> L22
+            throw r4     // Catch: java.lang.Throwable -> L22
+        L2b:
+            r5.f50912i = r0
+            boolean r0 = r5.f50915l
+            if (r0 == 0) goto L36
+            r5.f50915l = r2
+            r5.x()
+        L36:
+            throw r1
+        L37:
+            r3 = move-exception
+            goto L40
+        L39:
+            r3 = move-exception
+            com.google.android.exoplayer2.upstream.RawResourceDataSource$RawResourceDataSourceException r4 = new com.google.android.exoplayer2.upstream.RawResourceDataSource$RawResourceDataSourceException     // Catch: java.lang.Throwable -> L37
+            r4.<init>(r0, r3, r1)     // Catch: java.lang.Throwable -> L37
+            throw r4     // Catch: java.lang.Throwable -> L37
+        L40:
+            r5.f50913j = r0
+            android.content.res.AssetFileDescriptor r4 = r5.f50912i     // Catch: java.lang.Throwable -> L55 java.io.IOException -> L57
+            if (r4 == 0) goto L49
+            r4.close()     // Catch: java.lang.Throwable -> L55 java.io.IOException -> L57
+        L49:
+            r5.f50912i = r0
+            boolean r0 = r5.f50915l
+            if (r0 == 0) goto L54
+            r5.f50915l = r2
+            r5.x()
+        L54:
+            throw r3
+        L55:
+            r1 = move-exception
+            goto L5e
+        L57:
+            r3 = move-exception
+            com.google.android.exoplayer2.upstream.RawResourceDataSource$RawResourceDataSourceException r4 = new com.google.android.exoplayer2.upstream.RawResourceDataSource$RawResourceDataSourceException     // Catch: java.lang.Throwable -> L55
+            r4.<init>(r0, r3, r1)     // Catch: java.lang.Throwable -> L55
+            throw r4     // Catch: java.lang.Throwable -> L55
+        L5e:
+            r5.f50912i = r0
+            boolean r0 = r5.f50915l
+            if (r0 == 0) goto L69
+            r5.f50915l = r2
+            r5.x()
+        L69:
+            throw r1
+        */
+        throw new UnsupportedOperationException("Method not decompiled: com.google.android.exoplayer2.upstream.RawResourceDataSource.close():void");
+    }
+
+    @Override // com.google.android.exoplayer2.upstream.o
+    @androidx.annotation.p0
+    public Uri getUri() {
+        return this.f50911h;
+    }
+
+    @Override // com.google.android.exoplayer2.upstream.k
+    public int read(byte[] bArr, int i10, int i11) throws RawResourceDataSourceException {
+        if (i11 == 0) {
+            return 0;
+        }
+        long j10 = this.f50914k;
+        if (j10 == 0) {
+            return -1;
+        }
+        if (j10 != -1) {
+            try {
+                i11 = (int) Math.min(j10, i11);
+            } catch (IOException e10) {
+                throw new RawResourceDataSourceException(null, e10, 2000);
+            }
+        }
+        int i12 = ((InputStream) com.google.android.exoplayer2.util.u0.k(this.f50913j)).read(bArr, i10, i11);
+        if (i12 == -1) {
+            if (this.f50914k == -1) {
+                return -1;
+            }
+            throw new RawResourceDataSourceException("End of stream reached having not read sufficient data.", new EOFException(), 2000);
+        }
+        long j11 = this.f50914k;
+        if (j11 != -1) {
+            this.f50914k = j11 - ((long) i12);
+        }
+        w(i12);
+        return i12;
+    }
+}

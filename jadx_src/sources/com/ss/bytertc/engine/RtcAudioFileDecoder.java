@@ -1,0 +1,427 @@
+package com.ss.bytertc.engine;
+
+import android.content.Context;
+import android.content.res.AssetFileDescriptor;
+import android.media.MediaCodec;
+import android.media.MediaCrypto;
+import android.media.MediaExtractor;
+import android.media.MediaFormat;
+import android.net.Uri;
+import android.os.Build;
+import android.text.TextUtils;
+import android.util.Log;
+import android.view.Surface;
+import android.webkit.URLUtil;
+import androidx.annotation.p0;
+import com.bytedance.realx.base.CalledByNative;
+import com.bytedance.realx.base.ContextUtils;
+import com.bytedance.realx.base.RXLogging;
+import java.io.InputStream;
+import java.net.HttpURLConnection;
+import java.net.URI;
+import java.net.URL;
+import java.net.URLDecoder;
+import java.nio.ByteBuffer;
+import java.util.Vector;
+import org.apache.tools.ant.taskdefs.email.b;
+
+/* JADX INFO: loaded from: classes4.dex */
+public class RtcAudioFileDecoder {
+    private static final int MAX_DECODER_RETRY_COUNT = 100;
+    private static final String TAG = "RtcAudioFileDecoder";
+    private boolean eoInputStream;
+    private boolean eoOutputStream;
+
+    @p0
+    private byte[] mDecodedData;
+
+    @p0
+    private MediaExtractor mExtractor;
+    private long mFileLength;
+    private ByteBuffer[] mInputBuffers;
+
+    @p0
+    private MediaCodec mMediaCodec;
+    private ByteBuffer[] mOutputBuffers;
+    private int mRetryCount;
+    private Vector<Integer> mTrackIds;
+
+    @p0
+    private MediaFormat mUsedTrackFormat;
+    private int mUsedTrackIdx;
+
+    /* JADX INFO: renamed from: oc, reason: collision with root package name */
+    private HttpURLConnection f97934oc;
+    private int mSampleRate = 0;
+    private int mChannels = 0;
+
+    @CalledByNative
+    RtcAudioFileDecoder() {
+        RXLogging.e(TAG, "AudioMix RtcAudioFileDecoder");
+    }
+
+    private boolean checkInfoChange() {
+        try {
+            MediaFormat outputFormat = this.mMediaCodec.getOutputFormat();
+            int integer = outputFormat.getInteger("sample-rate");
+            int integer2 = outputFormat.getInteger("channel-count");
+            boolean z10 = (this.mSampleRate == integer && this.mChannels == integer2) ? false : true;
+            this.mSampleRate = integer;
+            this.mChannels = integer2;
+            return z10;
+        } catch (Exception e10) {
+            e10.printStackTrace();
+            RXLogging.e(TAG, "Error when checking file's new format");
+            return false;
+        }
+    }
+
+    private boolean checkUrlEncoded(String str) {
+        try {
+            return !TextUtils.equals(str, URLDecoder.decode(str, "UTF-8"));
+        } catch (Exception e10) {
+            e10.printStackTrace();
+            RXLogging.e(TAG, "Error when releasing audio file stream");
+            return false;
+        }
+    }
+
+    private String encodeUrl(String str) {
+        RXLogging.e(TAG, "encodedUrl");
+        try {
+            URL url = new URL(str);
+            return new URI(url.getProtocol(), url.getUserInfo(), url.getHost(), url.getPort(), url.getPath(), url.getQuery(), url.getRef()).toASCIIString();
+        } catch (Exception e10) {
+            e10.printStackTrace();
+            return str;
+        }
+    }
+
+    private boolean isAvailableOnlineURL(String str) {
+        boolean z10;
+        RXLogging.e(TAG, "isAvailableOnlineURL");
+        this.f97934oc = null;
+        try {
+            HttpURLConnection httpURLConnection = (HttpURLConnection) new URL(str).openConnection();
+            this.f97934oc = httpURLConnection;
+            httpURLConnection.setUseCaches(false);
+            this.f97934oc.setConnectTimeout(4000);
+            RXLogging.e(TAG, "connect done....");
+            int responseCode = this.f97934oc.getResponseCode();
+            if (200 == responseCode) {
+                z10 = true;
+            } else {
+                RXLogging.e(TAG, "url is not available, error:" + responseCode);
+                z10 = false;
+            }
+            InputStream inputStream = this.f97934oc.getInputStream();
+            if (inputStream != null) {
+                inputStream.close();
+            }
+            return z10;
+        } catch (Exception e10) {
+            e10.printStackTrace();
+            RXLogging.e(TAG, "++Error when test online url: " + e10.getMessage());
+        } finally {
+            HttpURLConnection httpURLConnection2 = this.f97934oc;
+            if (httpURLConnection2 != null) {
+                httpURLConnection2.disconnect();
+            }
+        }
+    }
+
+    @CalledByNative
+    public void disConnectURL() {
+        RXLogging.e(TAG, "disConnectURL");
+        HttpURLConnection httpURLConnection = this.f97934oc;
+        if (httpURLConnection != null) {
+            httpURLConnection.disconnect();
+        }
+    }
+
+    @CalledByNative
+    public int getAudioTrackCount() {
+        Vector<Integer> vector = this.mTrackIds;
+        if (vector == null) {
+            return 0;
+        }
+        return vector.size();
+    }
+
+    @CalledByNative
+    public int getChannelCount() {
+        return this.mChannels;
+    }
+
+    @CalledByNative
+    public long getCurrentFilePosition() {
+        try {
+            return this.mExtractor.getSampleTime() / 1000;
+        } catch (Exception e10) {
+            e10.printStackTrace();
+            RXLogging.e(TAG, "Error when getCurrentFilePosition");
+            return 0L;
+        }
+    }
+
+    @CalledByNative
+    @p0
+    public byte[] getDecodedData() {
+        return this.mDecodedData;
+    }
+
+    @CalledByNative
+    public long getFileLength() {
+        return this.mFileLength / 1000;
+    }
+
+    @CalledByNative
+    public int getSampleRate() {
+        return this.mSampleRate;
+    }
+
+    @CalledByNative
+    public int getUsedTrackIdx() {
+        return this.mUsedTrackIdx;
+    }
+
+    @CalledByNative
+    boolean init(String str, int i10) {
+        try {
+            RXLogging.i(TAG, "Try to decode audio file : " + str);
+            this.mTrackIds = new Vector<>();
+            if (URLUtil.isNetworkUrl(str)) {
+                if (!checkUrlEncoded(str)) {
+                    str = encodeUrl(str);
+                }
+                if (str == null || !isAvailableOnlineURL(str)) {
+                    return false;
+                }
+            }
+            this.mRetryCount = 0;
+            this.mExtractor = new MediaExtractor();
+            Context applicationContext = ContextUtils.getApplicationContext();
+            if (str.startsWith("/assets/") && applicationContext != null) {
+                AssetFileDescriptor assetFileDescriptorOpenFd = applicationContext.getAssets().openFd(str.substring(8));
+                this.mExtractor.setDataSource(assetFileDescriptorOpenFd.getFileDescriptor(), assetFileDescriptorOpenFd.getStartOffset(), assetFileDescriptorOpenFd.getLength());
+            } else if (!str.startsWith("content://") || applicationContext == null) {
+                this.mExtractor.setDataSource(str);
+            } else {
+                this.mExtractor.setDataSource(applicationContext.getContentResolver().openFileDescriptor(Uri.parse(str), "r").getFileDescriptor());
+            }
+            int trackCount = this.mExtractor.getTrackCount();
+            for (int i11 = 0; i11 < trackCount; i11++) {
+                this.mExtractor.unselectTrack(i11);
+            }
+            if (i10 + 1 > trackCount) {
+                RXLogging.e(TAG, "useTrack > trackCount");
+                return false;
+            }
+            this.mChannels = 0;
+            int i12 = 0;
+            for (int i13 = 0; i13 < trackCount; i13++) {
+                MediaFormat trackFormat = this.mExtractor.getTrackFormat(i13);
+                String string = trackFormat.getString(b.I);
+                if (string.contains("audio/")) {
+                    if (i10 == i12) {
+                        this.mExtractor.selectTrack(i13);
+                        MediaCodec mediaCodecCreateDecoderByType = MediaCodec.createDecoderByType(string);
+                        this.mMediaCodec = mediaCodecCreateDecoderByType;
+                        mediaCodecCreateDecoderByType.configure(trackFormat, (Surface) null, (MediaCrypto) null, 0);
+                        this.mUsedTrackFormat = trackFormat;
+                        this.mUsedTrackIdx = i12;
+                    }
+                    i12++;
+                    this.mTrackIds.addElement(new Integer(i13));
+                    int integer = trackFormat.getInteger("channel-count");
+                    if (integer > this.mChannels) {
+                        this.mChannels = integer;
+                    }
+                }
+            }
+            MediaCodec mediaCodec = this.mMediaCodec;
+            if (mediaCodec == null) {
+                RXLogging.e(TAG, "mMediaCodec is null");
+                return false;
+            }
+            mediaCodec.start();
+            this.mSampleRate = this.mUsedTrackFormat.getInteger("sample-rate");
+            this.mFileLength = this.mUsedTrackFormat.getLong("durationUs");
+            return true;
+        } catch (Exception e10) {
+            e10.printStackTrace();
+            RXLogging.e(TAG, "Error when creating audio file decode, error:" + e10.getMessage());
+            RXLogging.e(TAG, "stack track: " + Log.getStackTraceString(e10));
+            return false;
+        }
+    }
+
+    /* JADX WARN: Code duplicated, block: B:55:0x0113 A[Catch: Exception -> 0x015a, TryCatch #0 {Exception -> 0x015a, blocks: (B:3:0x0006, B:5:0x000a, B:8:0x0010, B:10:0x0018, B:12:0x001e, B:14:0x002c, B:16:0x0031, B:18:0x0041, B:19:0x0043, B:20:0x004f, B:22:0x0053, B:28:0x006a, B:30:0x006e, B:32:0x0074, B:33:0x0076, B:37:0x008b, B:38:0x0095, B:40:0x009a, B:41:0x00bf, B:44:0x00d7, B:43:0x00c5, B:45:0x00de, B:47:0x00e7, B:49:0x00f3, B:51:0x00ff, B:53:0x0109, B:55:0x0113, B:56:0x0148, B:57:0x0152, B:58:0x0157), top: B:64:0x0006 }] */
+    /* JADX WARN: Instruction removed from duplicated block: B:55:0x0113, please report this as an issue */
+    @CalledByNative
+    public boolean readAudioData() {
+        int iDequeueInputBuffer;
+        int i10;
+        try {
+            MediaCodec mediaCodec = this.mMediaCodec;
+            if (mediaCodec != null && this.mExtractor != null) {
+                if (!this.eoInputStream && (iDequeueInputBuffer = mediaCodec.dequeueInputBuffer(0L)) >= 0) {
+                    int sampleData = this.mExtractor.readSampleData(this.mMediaCodec.getInputBuffer(iDequeueInputBuffer), 0);
+                    if (sampleData <= 0) {
+                        this.eoInputStream = true;
+                        i10 = 0;
+                    } else {
+                        i10 = sampleData;
+                    }
+                    long sampleTime = this.mExtractor.getSampleTime();
+                    int sampleFlags = this.mExtractor.getSampleFlags();
+                    if (this.eoInputStream) {
+                        sampleFlags |= 4;
+                    }
+                    this.mMediaCodec.queueInputBuffer(iDequeueInputBuffer, 0, i10, sampleTime, sampleFlags);
+                    this.mExtractor.advance();
+                }
+                if (!this.eoOutputStream) {
+                    MediaCodec.BufferInfo bufferInfo = new MediaCodec.BufferInfo();
+                    int iDequeueOutputBuffer = this.mMediaCodec.dequeueOutputBuffer(bufferInfo, 0L);
+                    this.mDecodedData = null;
+                    if (iDequeueOutputBuffer == -3 || iDequeueOutputBuffer == -2) {
+                        this.mDecodedData = new byte[0];
+                    } else if (iDequeueOutputBuffer != -1) {
+                        this.mRetryCount = 0;
+                        if (iDequeueOutputBuffer >= 0) {
+                            if ((bufferInfo.flags & 4) == 4) {
+                                this.eoOutputStream = true;
+                            }
+                            ByteBuffer outputBuffer = this.mMediaCodec.getOutputBuffer(iDequeueOutputBuffer);
+                            int integer = this.mUsedTrackFormat.getInteger("channel-count");
+                            int i11 = this.mChannels;
+                            if (integer != i11 && i11 == 2) {
+                                this.mDecodedData = new byte[outputBuffer.limit() * 2];
+                                for (int i12 = 0; i12 < bufferInfo.size / 2; i12++) {
+                                    int i13 = i12 * 4;
+                                    this.mDecodedData[i13] = outputBuffer.get();
+                                    byte[] bArr = this.mDecodedData;
+                                    bArr[i13 + 2] = bArr[i13];
+                                    int i14 = i13 + 1;
+                                    bArr[i14] = outputBuffer.get();
+                                    byte[] bArr2 = this.mDecodedData;
+                                    bArr2[i13 + 3] = bArr2[i14];
+                                }
+                                outputBuffer.clear();
+                            } else if (integer == i11) {
+                                byte[] bArr3 = new byte[outputBuffer.limit()];
+                                this.mDecodedData = bArr3;
+                                outputBuffer.get(bArr3, bufferInfo.offset, bufferInfo.size);
+                                outputBuffer.clear();
+                            }
+                            this.mMediaCodec.releaseOutputBuffer(iDequeueOutputBuffer, false);
+                        }
+                    } else {
+                        int i15 = this.mRetryCount + 1;
+                        this.mRetryCount = i15;
+                        if (i15 >= 100) {
+                            String str = Build.BRAND;
+                            if (str.toLowerCase().contains("meizu")) {
+                                RXLogging.e(TAG, "EAGAIN count=" + this.mRetryCount + " presentationTimeUs=" + bufferInfo.presentationTimeUs + " totalUs=" + this.mFileLength + " Force EOS");
+                                this.eoOutputStream = true;
+                                this.mRetryCount = 0;
+                            } else {
+                                String str2 = Build.MANUFACTURER;
+                                if (str2.toLowerCase().contains("meizu") || str.toLowerCase().contains("vivo") || str2.toLowerCase().contains("vivo")) {
+                                    RXLogging.e(TAG, "EAGAIN count=" + this.mRetryCount + " presentationTimeUs=" + bufferInfo.presentationTimeUs + " totalUs=" + this.mFileLength + " Force EOS");
+                                    this.eoOutputStream = true;
+                                    this.mRetryCount = 0;
+                                }
+                            }
+                        }
+                        this.mDecodedData = new byte[0];
+                        Thread.sleep(3L);
+                    }
+                }
+                return this.eoOutputStream;
+            }
+            return this.eoInputStream;
+        } catch (Exception e10) {
+            e10.printStackTrace();
+        }
+    }
+
+    @CalledByNative
+    public boolean selectTrack(int i10) {
+        try {
+            Vector<Integer> vector = this.mTrackIds;
+            if (vector == null || i10 + 1 > vector.size() || this.mUsedTrackIdx == i10) {
+                return false;
+            }
+            MediaExtractor mediaExtractor = this.mExtractor;
+            if (mediaExtractor != null && this.mMediaCodec != null) {
+                MediaFormat trackFormat = mediaExtractor.getTrackFormat(this.mTrackIds.get(i10).intValue());
+                if (this.mSampleRate != trackFormat.getInteger("sample-rate")) {
+                    RXLogging.e(TAG, "mSampleRate = " + this.mSampleRate + ", used_SampleRate = " + trackFormat.getInteger("sample-rate"));
+                    return false;
+                }
+                long sampleTime = this.mExtractor.getSampleTime();
+                RXLogging.e(TAG, "++current_postion = " + sampleTime);
+                this.mExtractor.unselectTrack(this.mTrackIds.get(this.mUsedTrackIdx).intValue());
+                this.mMediaCodec.stop();
+                trackFormat.getString(b.I);
+                this.mExtractor.selectTrack(this.mTrackIds.get(i10).intValue());
+                this.mExtractor.seekTo(sampleTime, 2);
+                this.mMediaCodec.configure(trackFormat, (Surface) null, (MediaCrypto) null, 0);
+                this.mMediaCodec.start();
+                this.mUsedTrackFormat = trackFormat;
+                this.mUsedTrackIdx = i10;
+                return true;
+            }
+            RXLogging.e(TAG, "mExtractor or mMediaCodec is null, mExtractor = " + this.mExtractor + ", mMediaCodec = " + this.mMediaCodec);
+            return false;
+        } catch (Exception e10) {
+            e10.printStackTrace();
+            RXLogging.e(TAG, "Error when selectTrack");
+            return false;
+        }
+    }
+
+    @CalledByNative
+    public void setCurrentFilePosition(long j10) {
+        if (this.eoOutputStream) {
+            try {
+                this.mMediaCodec.flush();
+            } catch (Exception e10) {
+                e10.printStackTrace();
+                RXLogging.e(TAG, "Error when setCurrentFilePosition, mMediaCodec.flush");
+            }
+        }
+        try {
+            this.mExtractor.seekTo(j10 * 1000, 2);
+            this.eoInputStream = false;
+            this.eoOutputStream = false;
+        } catch (Exception e11) {
+            e11.printStackTrace();
+            RXLogging.e(TAG, "Error when setCurrentFilePosition, mExtractor.seekTo");
+        }
+    }
+
+    @CalledByNative
+    public void uninit() {
+        try {
+            MediaCodec mediaCodec = this.mMediaCodec;
+            if (mediaCodec != null) {
+                mediaCodec.stop();
+                this.mMediaCodec.release();
+                this.mMediaCodec = null;
+            }
+            MediaExtractor mediaExtractor = this.mExtractor;
+            if (mediaExtractor != null) {
+                mediaExtractor.release();
+                this.mExtractor = null;
+            }
+        } catch (Exception e10) {
+            e10.printStackTrace();
+            RXLogging.e(TAG, "Error when releasing audio file stream" + e10.getMessage());
+        }
+        this.eoOutputStream = false;
+        this.eoInputStream = false;
+    }
+}

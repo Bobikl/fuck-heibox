@@ -1,0 +1,16 @@
+package androidx.compose.foundation.lazy.grid;
+
+import com.starlightc.ucropplus.ui.UCropPlusActivity;
+import com.umeng.analytics.pro.ak;
+import kotlin.Metadata;
+import kotlin.b2;
+
+/* JADX INFO: compiled from: LazyGridDsl.kt */
+/* JADX INFO: loaded from: classes.dex */
+@t
+@Metadata(bv = {}, d1 = {"\u0000J\n\u0002\u0018\u0002\n\u0002\u0010\u0000\n\u0000\n\u0002\u0018\u0002\n\u0002\u0018\u0002\n\u0002\u0018\u0002\n\u0002\u0018\u0002\n\u0002\b\u0002\n\u0002\u0018\u0002\n\u0002\u0018\u0002\n\u0002\u0018\u0002\n\u0002\b\u0003\n\u0002\u0010\b\n\u0000\n\u0002\u0018\u0002\n\u0002\b\u0002\n\u0002\u0018\u0002\n\u0002\b\u0003\n\u0002\u0018\u0002\n\u0000\bw\u0018\u00002\u00020\u0001Je\u0010\r\u001a\u00020\n2\n\b\u0002\u0010\u0002\u001a\u0004\u0018\u00010\u00012\u001b\b\u0002\u0010\u0007\u001a\u0015\u0012\u0004\u0012\u00020\u0004\u0012\u0004\u0012\u00020\u0005\u0018\u00010\u0003¢\u0006\u0002\b\u00062\n\b\u0002\u0010\b\u001a\u0004\u0018\u00010\u00012\u001c\u0010\f\u001a\u0018\u0012\u0004\u0012\u00020\t\u0012\u0004\u0012\u00020\n0\u0003¢\u0006\u0002\b\u000b¢\u0006\u0002\b\u0006H&ø\u0001\u0000¢\u0006\u0004\b\r\u0010\u000eJÍ\u0001\u0010\u0016\u001a\u00020\n2\u0006\u0010\u0010\u001a\u00020\u000f2%\b\u0002\u0010\u0002\u001a\u001f\u0012\u0013\u0012\u00110\u000f¢\u0006\f\b\u0011\u0012\b\b\u0012\u0012\u0004\b\b(\u0013\u0012\u0004\u0012\u00020\u0001\u0018\u00010\u000320\b\u0002\u0010\u0007\u001a*\u0012\u0004\u0012\u00020\u0004\u0012\u0013\u0012\u00110\u000f¢\u0006\f\b\u0011\u0012\b\b\u0012\u0012\u0004\b\b(\u0013\u0012\u0004\u0012\u00020\u0005\u0018\u00010\u0014¢\u0006\u0002\b\u00062%\b\u0002\u0010\b\u001a\u001f\u0012\u0013\u0012\u00110\u000f¢\u0006\f\b\u0011\u0012\b\b\u0012\u0012\u0004\b\b(\u0013\u0012\u0006\u0012\u0004\u0018\u00010\u00010\u000321\u0010\u0015\u001a-\u0012\u0004\u0012\u00020\t\u0012\u0013\u0012\u00110\u000f¢\u0006\f\b\u0011\u0012\b\b\u0012\u0012\u0004\b\b(\u0013\u0012\u0004\u0012\u00020\n0\u0014¢\u0006\u0002\b\u000b¢\u0006\u0002\b\u0006H&ø\u0001\u0000¢\u0006\u0004\b\u0016\u0010\u0017\u0082\u0001\u0001\u0018ø\u0001\u0001\u0082\u0002\n\n\u0002\b\u0019\n\u0004\b!0\u0001¨\u0006\u0019À\u0006\u0001"}, d2 = {"Landroidx/compose/foundation/lazy/grid/s;", "", "key", "Lkotlin/Function1;", "Landroidx/compose/foundation/lazy/grid/m;", "Landroidx/compose/foundation/lazy/grid/d;", "Lkotlin/t;", com.google.android.exoplayer2.text.ttml.d.f49805s, "contentType", "Landroidx/compose/foundation/lazy/grid/l;", "Lkotlin/b2;", "Landroidx/compose/runtime/h;", "content", "b", "(Ljava/lang/Object;Lyh/l;Ljava/lang/Object;Lyh/q;)V", "", "count", "Lkotlin/m0;", "name", UCropPlusActivity.ARG_INDEX, "Lkotlin/Function2;", "itemContent", ak.av, "(ILyh/l;Lyh/p;Lyh/l;Lyh/r;)V", "Landroidx/compose/foundation/lazy/grid/LazyGridScopeImpl;", "foundation_release"}, k = 1, mv = {1, 7, 1})
+public interface s {
+    void a(int count, @dl.e yh.l<? super Integer, ? extends Object> key, @dl.e yh.p<? super m, ? super Integer, d> span, @dl.d yh.l<? super Integer, ? extends Object> contentType, @dl.d yh.r<? super l, ? super Integer, ? super androidx.compose.runtime.p, ? super Integer, b2> itemContent);
+
+    void b(@dl.e Object key, @dl.e yh.l<? super m, d> span, @dl.e Object contentType, @dl.d yh.q<? super l, ? super androidx.compose.runtime.p, ? super Integer, b2> content);
+}

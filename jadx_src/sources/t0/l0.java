@@ -1,0 +1,197 @@
+package t0;
+
+import androidx.compose.material3.tokens.ColorSchemeKeyTokens;
+import androidx.compose.material3.tokens.ShapeKeyTokens;
+import com.ss.bytertc.base.media.screen.RXScreenCaptureService;
+import com.umeng.analytics.pro.ak;
+import kotlin.Metadata;
+
+/* JADX INFO: compiled from: OutlinedIconButtonTokens.kt */
+/* JADX INFO: loaded from: classes.dex */
+@Metadata(bv = {}, d1 = {"\u0000 \n\u0002\u0018\u0002\n\u0002\u0010\u0000\n\u0002\u0018\u0002\n\u0002\b\u0004\n\u0002\u0018\u0002\n\u0002\b\u0004\n\u0002\u0018\u0002\n\u0002\b#\bÀ\u0002\u0018\u00002\u00020\u0001B\t\b\u0002¢\u0006\u0004\b-\u0010.R\u0017\u0010\u0003\u001a\u00020\u00028\u0006¢\u0006\f\n\u0004\b\u0003\u0010\u0004\u001a\u0004\b\u0005\u0010\u0006R \u0010\b\u001a\u00020\u00078\u0006ø\u0001\u0000ø\u0001\u0001ø\u0001\u0002¢\u0006\f\n\u0004\b\b\u0010\t\u001a\u0004\b\n\u0010\u000bR\u0017\u0010\r\u001a\u00020\f8\u0006¢\u0006\f\n\u0004\b\r\u0010\u000e\u001a\u0004\b\u000f\u0010\u0010R\u0017\u0010\u0011\u001a\u00020\f8\u0006¢\u0006\f\n\u0004\b\u0011\u0010\u000e\u001a\u0004\b\u0012\u0010\u0010R\u0017\u0010\u0013\u001a\u00020\f8\u0006¢\u0006\f\n\u0004\b\u0013\u0010\u000e\u001a\u0004\b\u0014\u0010\u0010R \u0010\u0015\u001a\u00020\u00078\u0006ø\u0001\u0000ø\u0001\u0001ø\u0001\u0002¢\u0006\f\n\u0004\b\u0015\u0010\t\u001a\u0004\b\u0016\u0010\u000bR\u0017\u0010\u0017\u001a\u00020\f8\u0006¢\u0006\f\n\u0004\b\u0017\u0010\u000e\u001a\u0004\b\u0018\u0010\u0010R\u0017\u0010\u0019\u001a\u00020\f8\u0006¢\u0006\f\n\u0004\b\u0019\u0010\u000e\u001a\u0004\b\u001a\u0010\u0010R\u0017\u0010\u001b\u001a\u00020\f8\u0006¢\u0006\f\n\u0004\b\u001b\u0010\u000e\u001a\u0004\b\u001c\u0010\u0010R\u0017\u0010\u001d\u001a\u00020\f8\u0006¢\u0006\f\n\u0004\b\u001d\u0010\u000e\u001a\u0004\b\u001e\u0010\u0010R\u0017\u0010\u001f\u001a\u00020\f8\u0006¢\u0006\f\n\u0004\b\u001f\u0010\u000e\u001a\u0004\b \u0010\u0010R\u0017\u0010!\u001a\u00020\f8\u0006¢\u0006\f\n\u0004\b!\u0010\u000e\u001a\u0004\b\"\u0010\u0010R\u0017\u0010#\u001a\u00020\f8\u0006¢\u0006\f\n\u0004\b#\u0010\u000e\u001a\u0004\b$\u0010\u0010R\u0017\u0010%\u001a\u00020\f8\u0006¢\u0006\f\n\u0004\b%\u0010\u000e\u001a\u0004\b&\u0010\u0010R\u0017\u0010'\u001a\u00020\f8\u0006¢\u0006\f\n\u0004\b'\u0010\u000e\u001a\u0004\b(\u0010\u0010R \u0010)\u001a\u00020\u00078\u0006ø\u0001\u0000ø\u0001\u0001ø\u0001\u0002¢\u0006\f\n\u0004\b)\u0010\t\u001a\u0004\b*\u0010\u000bR\u0017\u0010+\u001a\u00020\f8\u0006¢\u0006\f\n\u0004\b+\u0010\u000e\u001a\u0004\b,\u0010\u0010\u0082\u0002\u000f\n\u0002\b\u0019\n\u0005\b¡\u001e0\u0001\n\u0002\b!¨\u0006/"}, d2 = {"Lt0/l0;", "", "Landroidx/compose/material3/tokens/ShapeKeyTokens;", "ContainerShape", "Landroidx/compose/material3/tokens/ShapeKeyTokens;", ak.av, "()Landroidx/compose/material3/tokens/ShapeKeyTokens;", "Ls1/h;", "ContainerSize", "F", "b", "()F", "Landroidx/compose/material3/tokens/ColorSchemeKeyTokens;", "DisabledColor", "Landroidx/compose/material3/tokens/ColorSchemeKeyTokens;", ak.aF, "()Landroidx/compose/material3/tokens/ColorSchemeKeyTokens;", "DisabledSelectedContainerColor", "d", "DisabledUnselectedOutlineColor", "e", "Size", "k", "SelectedContainerColor", "g", "SelectedFocusColor", RXScreenCaptureService.KEY_HEIGHT, "SelectedHoverColor", "i", "SelectedColor", "f", "SelectedPressedColor", "j", "UnselectedFocusColor", "m", "UnselectedHoverColor", "n", "UnselectedColor", "l", "UnselectedOutlineColor", "o", "UnselectedOutlineWidth", "p", "UnselectedPressedColor", "q", "<init>", "()V", "material3_release"}, k = 1, mv = {1, 7, 1})
+public final class l0 {
+
+    /* JADX INFO: renamed from: a, reason: collision with root package name */
+    @dl.d
+    public static final l0 f139987a = new l0();
+
+    /* JADX INFO: renamed from: b, reason: collision with root package name */
+    @dl.d
+    private static final ShapeKeyTokens f139988b = ShapeKeyTokens.CornerFull;
+
+    /* JADX INFO: renamed from: c, reason: collision with root package name */
+    private static final float f139989c = s1.h.g((float) 40.0d);
+
+    /* JADX INFO: renamed from: d, reason: collision with root package name */
+    @dl.d
+    private static final ColorSchemeKeyTokens f139990d;
+
+    /* JADX INFO: renamed from: e, reason: collision with root package name */
+    public static final float f139991e = 0.38f;
+
+    /* JADX INFO: renamed from: f, reason: collision with root package name */
+    @dl.d
+    private static final ColorSchemeKeyTokens f139992f;
+
+    /* JADX INFO: renamed from: g, reason: collision with root package name */
+    public static final float f139993g = 0.12f;
+
+    /* JADX INFO: renamed from: h, reason: collision with root package name */
+    @dl.d
+    private static final ColorSchemeKeyTokens f139994h;
+
+    /* JADX INFO: renamed from: i, reason: collision with root package name */
+    public static final float f139995i = 0.12f;
+
+    /* JADX INFO: renamed from: j, reason: collision with root package name */
+    private static final float f139996j;
+
+    /* JADX INFO: renamed from: k, reason: collision with root package name */
+    @dl.d
+    private static final ColorSchemeKeyTokens f139997k;
+
+    /* JADX INFO: renamed from: l, reason: collision with root package name */
+    @dl.d
+    private static final ColorSchemeKeyTokens f139998l;
+
+    /* JADX INFO: renamed from: m, reason: collision with root package name */
+    @dl.d
+    private static final ColorSchemeKeyTokens f139999m;
+
+    /* JADX INFO: renamed from: n, reason: collision with root package name */
+    @dl.d
+    private static final ColorSchemeKeyTokens f140000n;
+
+    /* JADX INFO: renamed from: o, reason: collision with root package name */
+    @dl.d
+    private static final ColorSchemeKeyTokens f140001o;
+
+    /* JADX INFO: renamed from: p, reason: collision with root package name */
+    @dl.d
+    private static final ColorSchemeKeyTokens f140002p;
+
+    /* JADX INFO: renamed from: q, reason: collision with root package name */
+    @dl.d
+    private static final ColorSchemeKeyTokens f140003q;
+
+    /* JADX INFO: renamed from: r, reason: collision with root package name */
+    @dl.d
+    private static final ColorSchemeKeyTokens f140004r;
+
+    /* JADX INFO: renamed from: s, reason: collision with root package name */
+    @dl.d
+    private static final ColorSchemeKeyTokens f140005s;
+
+    /* JADX INFO: renamed from: t, reason: collision with root package name */
+    private static final float f140006t;
+
+    /* JADX INFO: renamed from: u, reason: collision with root package name */
+    @dl.d
+    private static final ColorSchemeKeyTokens f140007u;
+
+    static {
+        ColorSchemeKeyTokens colorSchemeKeyTokens = ColorSchemeKeyTokens.OnSurface;
+        f139990d = colorSchemeKeyTokens;
+        f139992f = colorSchemeKeyTokens;
+        f139994h = colorSchemeKeyTokens;
+        f139996j = s1.h.g((float) 24.0d);
+        f139997k = ColorSchemeKeyTokens.InverseSurface;
+        ColorSchemeKeyTokens colorSchemeKeyTokens2 = ColorSchemeKeyTokens.InverseOnSurface;
+        f139998l = colorSchemeKeyTokens2;
+        f139999m = colorSchemeKeyTokens2;
+        f140000n = colorSchemeKeyTokens2;
+        f140001o = colorSchemeKeyTokens2;
+        ColorSchemeKeyTokens colorSchemeKeyTokens3 = ColorSchemeKeyTokens.OnSurfaceVariant;
+        f140002p = colorSchemeKeyTokens3;
+        f140003q = colorSchemeKeyTokens3;
+        f140004r = colorSchemeKeyTokens3;
+        f140005s = ColorSchemeKeyTokens.Outline;
+        f140006t = s1.h.g((float) 1.0d);
+        f140007u = colorSchemeKeyTokens;
+    }
+
+    private l0() {
+    }
+
+    @dl.d
+    public final ShapeKeyTokens a() {
+        return f139988b;
+    }
+
+    public final float b() {
+        return f139989c;
+    }
+
+    @dl.d
+    public final ColorSchemeKeyTokens c() {
+        return f139990d;
+    }
+
+    @dl.d
+    public final ColorSchemeKeyTokens d() {
+        return f139992f;
+    }
+
+    @dl.d
+    public final ColorSchemeKeyTokens e() {
+        return f139994h;
+    }
+
+    @dl.d
+    public final ColorSchemeKeyTokens f() {
+        return f140000n;
+    }
+
+    @dl.d
+    public final ColorSchemeKeyTokens g() {
+        return f139997k;
+    }
+
+    @dl.d
+    public final ColorSchemeKeyTokens h() {
+        return f139998l;
+    }
+
+    @dl.d
+    public final ColorSchemeKeyTokens i() {
+        return f139999m;
+    }
+
+    @dl.d
+    public final ColorSchemeKeyTokens j() {
+        return f140001o;
+    }
+
+    public final float k() {
+        return f139996j;
+    }
+
+    @dl.d
+    public final ColorSchemeKeyTokens l() {
+        return f140004r;
+    }
+
+    @dl.d
+    public final ColorSchemeKeyTokens m() {
+        return f140002p;
+    }
+
+    @dl.d
+    public final ColorSchemeKeyTokens n() {
+        return f140003q;
+    }
+
+    @dl.d
+    public final ColorSchemeKeyTokens o() {
+        return f140005s;
+    }
+
+    public final float p() {
+        return f140006t;
+    }
+
+    @dl.d
+    public final ColorSchemeKeyTokens q() {
+        return f140007u;
+    }
+}

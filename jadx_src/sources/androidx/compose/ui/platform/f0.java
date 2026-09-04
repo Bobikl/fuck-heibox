@@ -1,0 +1,25 @@
+package androidx.compose.ui.platform;
+
+import android.view.accessibility.AccessibilityManager;
+import com.umeng.analytics.pro.ak;
+import kotlin.Metadata;
+
+/* JADX INFO: compiled from: AndroidAccessibilityManager.android.kt */
+/* JADX INFO: loaded from: classes.dex */
+@androidx.annotation.w0(29)
+@Metadata(bv = {}, d1 = {"\u0000\u0016\n\u0002\u0018\u0002\n\u0002\u0010\u0000\n\u0002\u0018\u0002\n\u0000\n\u0002\u0010\b\n\u0002\b\u0006\bÁ\u0002\u0018\u00002\u00020\u0001B\t\b\u0002¢\u0006\u0004\b\b\u0010\tJ \u0010\u0007\u001a\u00020\u00042\u0006\u0010\u0003\u001a\u00020\u00022\u0006\u0010\u0005\u001a\u00020\u00042\u0006\u0010\u0006\u001a\u00020\u0004H\u0007¨\u0006\n"}, d2 = {"Landroidx/compose/ui/platform/f0;", "", "Landroid/view/accessibility/AccessibilityManager;", "accessibilityManager", "", "originalTimeout", "uiContentFlags", ak.av, "<init>", "()V", "ui_release"}, k = 1, mv = {1, 7, 1})
+public final class f0 {
+
+    /* JADX INFO: renamed from: a, reason: collision with root package name */
+    @dl.d
+    public static final f0 f15854a = new f0();
+
+    private f0() {
+    }
+
+    @androidx.annotation.u
+    public final int a(@dl.d AccessibilityManager accessibilityManager, int originalTimeout, int uiContentFlags) {
+        kotlin.jvm.internal.f0.p(accessibilityManager, "accessibilityManager");
+        return accessibilityManager.getRecommendedTimeoutMillis(originalTimeout, uiContentFlags);
+    }
+}

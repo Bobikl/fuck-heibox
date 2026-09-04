@@ -43,4 +43,8 @@ gradle :app:assembleRelease --no-daemon
 app/build/outputs/apk/release/app-release.apk
 ```
 
-本仓库只跟踪源代码、资源和构建配置，不提交 `build`、`.gradle`、本地 SDK 配置和 APK 文件。
+## 静态分析资料
+
+`jadx_src/` 保存适配基准 APK 的完整 JADX 反编译快照，包含应用源码、依赖库和混淆包，详情参见 [`jadx_src/README.md`](jadx_src/README.md)。该目录仅用于 Hook 定位和版本适配，不参与模块构建。
+
+本仓库跟踪模块源码、反编译分析资料、资源和构建配置，不提交 `build`、`.gradle`、本地 SDK 配置和 APK 文件。正式 APK 通过 GitHub Releases 发布。

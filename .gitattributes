@@ -1,0 +1,2 @@
+jadx_src/**/*.java text eol=lf
+jadx_src/**/*.md text eol=lf

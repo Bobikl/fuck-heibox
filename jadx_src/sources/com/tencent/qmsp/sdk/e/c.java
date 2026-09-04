@@ -1,0 +1,33 @@
+package com.tencent.qmsp.sdk.e;
+
+import com.tencent.qmsp.sdk.c.f;
+import com.tencent.qmsp.sdk.c.i;
+import com.tencent.qmsp.sdk.f.g;
+
+/* JADX INFO: loaded from: classes4.dex */
+public class c {
+
+    public static final class a implements Runnable {
+        a() {
+        }
+
+        @Override // java.lang.Runnable
+        public void run() {
+            try {
+                if (com.tencent.qmsp.sdk.app.a.getContext() != null) {
+                    com.tencent.qmsp.sdk.d.c cVar = new com.tencent.qmsp.sdk.d.c(com.tencent.qmsp.sdk.app.a.getContext());
+                    f.i().a(cVar);
+                    cVar.a();
+                } else {
+                    g.d("qp.updTask", 2, "Context is null!");
+                }
+            } catch (Exception e10) {
+                e10.printStackTrace();
+            }
+        }
+    }
+
+    public static void a() {
+        f.i().c().postDelayed(new a(), i.f101809e);
+    }
+}

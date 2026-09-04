@@ -1,0 +1,120 @@
+package com.max.video.impl;
+
+import com.max.video.AbsVideoView;
+import com.max.video.player.info.WindowMode;
+import com.meituan.robust.ChangeQuickRedirect;
+import com.meituan.robust.PatchProxy;
+import com.meituan.robust.PatchProxyResult;
+import kotlin.KotlinNothingValueException;
+import kotlin.b2;
+import kotlin.coroutines.jvm.internal.SuspendLambda;
+import kotlin.t0;
+import kotlinx.coroutines.flow.u;
+import kotlinx.coroutines.q0;
+import yh.p;
+
+/* JADX INFO: compiled from: PlainVideoUI.kt */
+/* JADX INFO: loaded from: classes8.dex */
+@kotlin.coroutines.jvm.internal.d(c = "com.max.video.impl.PlainVideoUI$bind$5", f = "PlainVideoUI.kt", i = {}, l = {bb.c.b.Z1}, m = "invokeSuspend", n = {}, s = {})
+public final class PlainVideoUI$bind$5 extends SuspendLambda implements p<q0, kotlin.coroutines.c<? super b2>, Object> {
+    public static ChangeQuickRedirect changeQuickRedirect;
+
+    /* JADX INFO: renamed from: b, reason: collision with root package name */
+    int f75963b;
+
+    /* JADX INFO: renamed from: c, reason: collision with root package name */
+    final /* synthetic */ AbsVideoView f75964c;
+
+    /* JADX INFO: renamed from: d, reason: collision with root package name */
+    final /* synthetic */ PlainVideoUI f75965d;
+
+    /* JADX INFO: compiled from: PlainVideoUI.kt */
+    public static final class a<T> implements kotlinx.coroutines.flow.f {
+        public static ChangeQuickRedirect changeQuickRedirect;
+
+        /* JADX INFO: renamed from: b, reason: collision with root package name */
+        final /* synthetic */ PlainVideoUI f75966b;
+
+        a(PlainVideoUI plainVideoUI) {
+            this.f75966b = plainVideoUI;
+        }
+
+        @dl.e
+        public final Object a(@dl.d WindowMode windowMode, @dl.d kotlin.coroutines.c<? super b2> cVar) {
+            PatchProxyResult patchProxyResultProxy = PatchProxy.proxy(new Object[]{windowMode, cVar}, this, changeQuickRedirect, false, bb.c.m.Rl, new Class[]{WindowMode.class, kotlin.coroutines.c.class}, Object.class);
+            if (patchProxyResultProxy.isSupported) {
+                return patchProxyResultProxy.result;
+            }
+            if (!this.f75966b.getDoNotShowPanelFirstTime() || !this.f75966b.G) {
+                this.f75966b.n(false, 3, 3000L);
+            }
+            this.f75966b.G = false;
+            com.max.video.device.c orientationEventManager = this.f75966b.getOrientationEventManager();
+            WindowMode windowMode2 = WindowMode.FULLSCREEN;
+            orientationEventManager.s(windowMode == windowMode2);
+            if (windowMode != windowMode2) {
+                this.f75966b.r();
+            }
+            return b2.f124493a;
+        }
+
+        @Override // kotlinx.coroutines.flow.f
+        public /* bridge */ /* synthetic */ Object emit(Object obj, kotlin.coroutines.c cVar) {
+            PatchProxyResult patchProxyResultProxy = PatchProxy.proxy(new Object[]{obj, cVar}, this, changeQuickRedirect, false, bb.c.m.Sl, new Class[]{Object.class, kotlin.coroutines.c.class}, Object.class);
+            return patchProxyResultProxy.isSupported ? patchProxyResultProxy.result : a((WindowMode) obj, cVar);
+        }
+    }
+
+    /* JADX WARN: 'super' call moved to the top of the method (can break code semantics) */
+    PlainVideoUI$bind$5(AbsVideoView absVideoView, PlainVideoUI plainVideoUI, kotlin.coroutines.c<? super PlainVideoUI$bind$5> cVar) {
+        super(2, cVar);
+        this.f75964c = absVideoView;
+        this.f75965d = plainVideoUI;
+    }
+
+    @Override // kotlin.coroutines.jvm.internal.BaseContinuationImpl
+    @dl.d
+    public final kotlin.coroutines.c<b2> create(@dl.e Object obj, @dl.d kotlin.coroutines.c<?> cVar) {
+        PatchProxyResult patchProxyResultProxy = PatchProxy.proxy(new Object[]{obj, cVar}, this, changeQuickRedirect, false, bb.c.m.Ol, new Class[]{Object.class, kotlin.coroutines.c.class}, kotlin.coroutines.c.class);
+        return patchProxyResultProxy.isSupported ? (kotlin.coroutines.c) patchProxyResultProxy.result : new PlainVideoUI$bind$5(this.f75964c, this.f75965d, cVar);
+    }
+
+    @Override // yh.p
+    public /* bridge */ /* synthetic */ Object invoke(q0 q0Var, kotlin.coroutines.c<? super b2> cVar) {
+        PatchProxyResult patchProxyResultProxy = PatchProxy.proxy(new Object[]{q0Var, cVar}, this, changeQuickRedirect, false, bb.c.m.Ql, new Class[]{Object.class, Object.class}, Object.class);
+        return patchProxyResultProxy.isSupported ? patchProxyResultProxy.result : invoke2(q0Var, cVar);
+    }
+
+    @dl.e
+    /* JADX INFO: renamed from: invoke, reason: avoid collision after fix types in other method */
+    public final Object invoke2(@dl.d q0 q0Var, @dl.e kotlin.coroutines.c<? super b2> cVar) {
+        PatchProxyResult patchProxyResultProxy = PatchProxy.proxy(new Object[]{q0Var, cVar}, this, changeQuickRedirect, false, bb.c.m.Pl, new Class[]{q0.class, kotlin.coroutines.c.class}, Object.class);
+        return patchProxyResultProxy.isSupported ? patchProxyResultProxy.result : ((PlainVideoUI$bind$5) create(q0Var, cVar)).invokeSuspend(b2.f124493a);
+    }
+
+    @Override // kotlin.coroutines.jvm.internal.BaseContinuationImpl
+    @dl.e
+    public final Object invokeSuspend(@dl.d Object obj) throws Throwable {
+        PatchProxyResult patchProxyResultProxy = PatchProxy.proxy(new Object[]{obj}, this, changeQuickRedirect, false, bb.c.m.Nl, new Class[]{Object.class}, Object.class);
+        if (patchProxyResultProxy.isSupported) {
+            return patchProxyResultProxy.result;
+        }
+        Object objH = kotlin.coroutines.intrinsics.b.h();
+        int i10 = this.f75963b;
+        if (i10 == 0) {
+            t0.n(obj);
+            u<WindowMode> windowMode = this.f75964c.getWindowMode();
+            a aVar = new a(this.f75965d);
+            this.f75963b = 1;
+            if (windowMode.a(aVar, this) == objH) {
+                return objH;
+            }
+        } else {
+            if (i10 != 1) {
+                throw new IllegalStateException("call to 'resume' before 'invoke' with coroutine");
+            }
+            t0.n(obj);
+        }
+        throw new KotlinNothingValueException();
+    }
+}

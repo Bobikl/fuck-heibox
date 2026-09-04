@@ -1,0 +1,21 @@
+package f8;
+
+/* JADX INFO: compiled from: BuildConfig.java */
+/* JADX INFO: loaded from: classes6.dex */
+public final class a {
+
+    /* JADX INFO: renamed from: a, reason: collision with root package name */
+    public static final boolean f118808a = false;
+
+    /* JADX INFO: renamed from: b, reason: collision with root package name */
+    public static final String f118809b = "com.github.penfeizhou.animation.frame";
+
+    /* JADX INFO: renamed from: c, reason: collision with root package name */
+    public static final String f118810c = "release";
+
+    /* JADX INFO: renamed from: d, reason: collision with root package name */
+    public static final int f118811d = 1;
+
+    /* JADX INFO: renamed from: e, reason: collision with root package name */
+    public static final String f118812e = "1.0";
+}
