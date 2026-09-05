@@ -6,6 +6,7 @@ local.properties
 *.apk
 *.aab
 *.log
+__pycache__/
 .externalNativeBuild/
 .cxx/
 captures/
