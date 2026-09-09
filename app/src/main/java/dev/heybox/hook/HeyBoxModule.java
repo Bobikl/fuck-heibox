@@ -185,7 +185,7 @@ public final class HeyBoxModule extends XposedModule {
     /** 标记 BaseResUICustomizer.y() 同步调用 K() 的页面选择绑定栈。 */
     private final ThreadLocal<Boolean> selectingViewerPage = new ThreadLocal<>();
     /** 只在 NewsTagListFragment.onHiddenChanged(false) 的同步调用栈内生效。 */
-    private final ThreadLocal<Boolean> suppressHomeVisibilityRefresh = new ThreadLocal<>();
+    private final ThreadLocal<Object> suppressHomeVisibilityRefresh = new ThreadLocal<>();
     private volatile Resources centerNavigationResources;
     private volatile int[] centerNavigationIds;
     private String currentProcessName = "";
@@ -3294,48 +3294,83 @@ public final class HeyBoxModule extends XposedModule {
     /**
      * 阻止返回首页后的自动刷新，同时保留手动下拉刷新。
      *
-     * <p>只处理从其它底部页面返回时，NewsTagListFragment.onHiddenChanged(false)
-     * 在离开超过 180 秒后同步调用 D3() 的路径。再次主动点击已选中的首页所发送的
-     * gotop 广播保持原样，因此用户仍可通过再次点击首页回到顶部。</p>
+     * <p>新闻标签页在距离最近数据返回超过 180 秒时刷新，热门页有独立的一小时
+     * 可见性刷新。只拦截这些入口中的 D3；保留手动下拉与 gotop。</p>
      */
-    private void installHomeReturnRefreshHook(ClassLoader classLoader) {
+    private void installHomeReturnRefreshHook(ClassLoader loader) {
+        int installed = installScopedHomeRefresh(loader,
+                "com.max.xiaoheihe.module.news.NewsTagListFragment", "onHiddenChanged", true);
+        installed += installScopedHomeRefresh(loader,
+                "com.max.xiaoheihe.module.bbs.HotNewsFragment", "onFragmentShow", false);
+        recordHookProgress("阻止返回首页自动刷新", installed, 4);
+        info("HOOK_HOME_RETURN_REFRESH_OK methods=" + installed + " strategy=scoped_visibility_v2");
+    }
+
+    /** 不修改刷新时间、请求、手动下拉或 gotop；首次初始化放行。 */
+    private int installScopedHomeRefresh(ClassLoader loader, String name,
+                                         String entryName, boolean hiddenCallback) {
         int installed = 0;
         try {
-            Class<?> newsTagList = Class.forName(
-                    "com.max.xiaoheihe.module.news.NewsTagListFragment",
-                    false, classLoader);
-            Method visibilityChanged = newsTagList.getMethod(
-                    "onHiddenChanged", boolean.class);
-            Method autoRefresh = newsTagList.getMethod("D3");
-            requireVoidReturn(autoRefresh);
-            hook(visibilityChanged).intercept(chain -> {
-                if (!Boolean.FALSE.equals(chain.getArg(0))) {
+            Class<?> owner = Class.forName(name, false, loader);
+            Method entry = hiddenCallback
+                    ? owner.getDeclaredMethod(entryName, boolean.class)
+                    : owner.getDeclaredMethod(entryName);
+            Method refresh = owner.getDeclaredMethod("D3");
+            Field first = Class.forName("com.max.hbcommon.base.d", false, loader)
+                    .getDeclaredField("mIsFirst");
+            first.setAccessible(true);
+            requireVoidReturn(entry);
+            requireVoidReturn(refresh);
+            WeakIdentitySet<Object> previouslyHidden = new WeakIdentitySet<>();
+            hook(entry).intercept(chain -> {
+                Object fragment = chain.getThisObject();
+                boolean suppress = false;
+                try {
+                    if (hiddenCallback && Boolean.TRUE.equals(chain.getArg(0))) {
+                        synchronized (previouslyHidden) {
+                            previouslyHidden.add(fragment);
+                        }
+                    } else if (!first.getBoolean(fragment)) {
+                        synchronized (previouslyHidden) {
+                            suppress = !hiddenCallback || previouslyHidden.contains(fragment);
+                        }
+                    }
+                } catch (Throwable error) {
+                    recordRuntimeFallback("首页刷新上下文", error);
+                }
+                if (!suppress) {
                     return chain.proceed();
                 }
-                suppressHomeVisibilityRefresh.set(Boolean.TRUE);
+                Object previous = suppressHomeVisibilityRefresh.get();
+                suppressHomeVisibilityRefresh.set(fragment);
                 try {
                     return chain.proceed();
                 } finally {
-                    suppressHomeVisibilityRefresh.remove();
+                    if (previous == null) {
+                        suppressHomeVisibilityRefresh.remove();
+                    } else {
+                        suppressHomeVisibilityRefresh.set(previous);
+                    }
                 }
             });
             installed++;
-            hook(autoRefresh).intercept(chain ->
-                    Boolean.TRUE.equals(suppressHomeVisibilityRefresh.get())
-                            ? null : chain.proceed());
+            hook(refresh).intercept(chain -> {
+                if (suppressHomeVisibilityRefresh.get() == chain.getThisObject()) {
+                    info("HOME_AUTO_REFRESH_BLOCK source=" + entryName);
+                    return null;
+                }
+                return chain.proceed();
+            });
             installed++;
-        } catch (Throwable throwable) {
-            warn("HOME_STALE_VISIBILITY_HOOK_SKIP reason="
-                    + unwrap(throwable).getClass().getSimpleName());
+            // D3 很短，防止调用方内联绕过 Hook。仅安装时处理低频入口。
+            if (!deoptimize(entry)) {
+                warn("HOME_REFRESH_DEOPT_FAILED source=" + entryName);
+            }
+        } catch (Throwable error) {
+            warn("HOME_STALE_VISIBILITY_HOOK_SKIP source=" + entryName
+                    + " reason=" + unwrap(error).getClass().getSimpleName());
         }
-
-        recordHookProgress("阻止返回首页自动刷新", installed, 2);
-        if (installed > 0) {
-            info("HOOK_HOME_RETURN_REFRESH_OK methods=" + installed
-                    + " stale=NewsTagListFragment.onHiddenChanged");
-        } else {
-            warn("HOOK_HOME_RETURN_REFRESH_EMPTY");
-        }
+        return installed;
     }
 
     /**
@@ -3353,7 +3388,6 @@ public final class HeyBoxModule extends XposedModule {
                     "K", mediaData, TextView.class);
             Method isOriginal = mediaData.getMethod("j");
             Method getOriginalUrl = mediaData.getMethod("g");
-            Method updateLoadedUrl = mediaData.getMethod("H", String.class);
             Class<?> viewHolder = Class.forName(
                     "androidx.recyclerview.widget.RecyclerView$ViewHolder",
                     false, classLoader);
@@ -3375,24 +3409,26 @@ public final class HeyBoxModule extends XposedModule {
                 }
             });
 
-            // HBImageLoader 仅在 Glide 的 onResourceReady 回调中写入当前 URL；因此 H()
-            // 返回时可以视为普通图片已真正加载完成，而不是仅完成页面或按钮绑定。
-            hook(updateLoadedUrl).intercept(chain -> {
+            // 普通图 k(View, MediaData) 仅从 onResourceReady 路径调用。
+            // 不再把全局 URL setter H()（失败换地址也会调用）当成加载完成。
+            Class<?> imageLoader = Class.forName(
+                    "com.max.xiaoheihe.utils.imageviewer.HBImageLoader", false, classLoader);
+            Method ready = imageLoader.getDeclaredMethod("k", View.class, mediaData);
+            hook(ready).intercept(chain -> {
                 Object result = chain.proceed();
-                Object data = chain.getThisObject();
-                TextView currentButton = null;
-                synchronized (requestedOriginalImages) {
-                    loadedViewerImages.add(data);
-                    if (selectedViewerImage.get() == data) {
-                        currentButton = selectedOriginalButton.get();
-                    }
-                }
-                if (currentButton != null) {
-                    requestOriginalImage(data, currentButton,
-                            isOriginal, getOriginalUrl);
-                }
+                markViewerImageReady(chain.getArg(1), isOriginal, getOriginalUrl, "normal");
                 return result;
             });
+            try {
+                Class<?> callback = Class.forName(
+                        "com.max.xiaoheihe.utils.imageviewer.HBImageLoader$load$onResourceReady$1",
+                        false, classLoader);
+                deoptimize(callback.getDeclaredMethod("a"));
+            } catch (Throwable error) {
+                warn("IMAGE_READY_DEOPT_SKIP reason=" + unwrap(error).getClass().getSimpleName());
+            }
+            installLongImageReadyHook(classLoader, imageLoader, mediaData,
+                    viewHolder, isOriginal, getOriginalUrl);
 
             hook(updateOriginal).intercept(chain -> {
                 Object result = chain.proceed();
@@ -3423,16 +3459,95 @@ public final class HeyBoxModule extends XposedModule {
                 return result;
             });
             recordHookGroup("图片增强");
-            info("HOOK_IMAGE_ENHANCE_OK method=BaseResUICustomizer.y/K+MediaData.H");
+            info("HOOK_IMAGE_ENHANCE_OK method=BaseResUICustomizer.y/K+HBImageLoader.k+long_ready");
         } catch (Throwable throwable) {
             error("HOOK_IMAGE_ENHANCE_ERROR", throwable);
         }
     }
 
-    /**
-     * 该方法只会在普通图完成后或已完成图片的原图按钮晚到时调用。
-     * performClick 通过 View.post 排到当前加载回调和布局工作之后，避免同一帧重载。
-     */
+    /** 普通图或长图就绪后登记，原图按钮晚到时由 K() 补触发。 */
+    private void markViewerImageReady(Object data, Method isOriginal,
+                                      Method getOriginalUrl, String source) {
+        if (data == null) return;
+        try {
+            TextView button;
+            synchronized (requestedOriginalImages) {
+                loadedViewerImages.add(data);
+                button = selectedViewerImage.get() == data ? selectedOriginalButton.get() : null;
+            }
+            if (button != null) {
+                info("IMAGE_VIEWER_READY source=" + source);
+                requestOriginalImage(data, button, isOriginal, getOriginalUrl);
+            }
+        } catch (Throwable error) {
+            recordRuntimeFallback("自动加载原图", error);
+        }
+    }
+
+    /** 长图只登记查看器绑定，在基础图层加载完成事件后触发；不轮询、不预取。 */
+    private void installLongImageReadyHook(ClassLoader loader, Class<?> imageLoader,
+                                           Class<?> mediaData, Class<?> holder,
+                                           Method isOriginal, Method getOriginalUrl) {
+        int installed = 0;
+        try {
+            Class<?> scale = Class.forName(
+                    "com.davemorrissey.labs.subscaleview.SubsamplingScaleImageView", false, loader);
+            Class<?> scale2 = Class.forName(
+                    "com.heybox.imageviewer.widgets.SubsamplingScaleImageView2", false, loader);
+            Class<?> listener = Class.forName(
+                    "com.heybox.imageviewer.widgets.SubsamplingScaleImageView2$b", false, loader);
+            Class<?> dataType = Class.forName("com.heybox.imageviewer.core.d", false, loader);
+            Field viewField = null;
+            for (Field field : listener.getDeclaredFields()) {
+                if (field.getType() == scale2 && !java.lang.reflect.Modifier.isStatic(field.getModifiers())) {
+                    if (viewField != null) throw new NoSuchFieldException("ambiguous long image view");
+                    viewField = field;
+                }
+            }
+            if (viewField == null) throw new NoSuchFieldException("long image view");
+            viewField.setAccessible(true);
+            final Field ownerView = viewField;
+            WeakIdentityMap<Object, WeakReference<Object>> bindings = new WeakIdentityMap<>();
+            Method bind = imageLoader.getDeclaredMethod("b", scale, dataType, holder);
+            Method ready = listener.getDeclaredMethod("onImageLoaded");
+            hook(bind).intercept(chain -> {
+                try {
+                    Object data = chain.getArg(1);
+                    synchronized (bindings) {
+                        bindings.put(chain.getArg(0), new WeakReference<>(mediaData.isInstance(data) ? data : null));
+                    }
+                } catch (Throwable error) {
+                    recordRuntimeFallback("长图绑定", error);
+                }
+                return chain.proceed();
+            });
+            installed++;
+            hook(ready).intercept(chain -> {
+                Object result = chain.proceed();
+                try {
+                    Object view = ownerView.get(chain.getThisObject());
+                    Object data;
+                    synchronized (bindings) {
+                        WeakReference<Object> reference = bindings.get(view);
+                        data = reference == null ? null : reference.get();
+                    }
+                    markViewerImageReady(data, isOriginal, getOriginalUrl, "long");
+                } catch (Throwable error) {
+                    recordRuntimeFallback("长图就绪", error);
+                }
+                return result;
+            });
+            installed++;
+            // 仅反优化完成条件检查，避免内联的监听器绕过 Hook；不 Hook 绘制和解码。
+            deoptimize(scale.getDeclaredMethod("checkImageLoaded"));
+            info("HOOK_LONG_IMAGE_READY_OK");
+        } catch (Throwable error) {
+            warn("HOOK_LONG_IMAGE_READY_SKIP reason=" + unwrap(error).getClass().getSimpleName());
+        }
+        recordHookProgress("图片/长图就绪", installed, 2);
+    }
+
+    /** 按当前页懒加载，排到加载回调后执行，仍在点击前校验当前页及网络。 */
     private void requestOriginalImage(Object data, TextView originalButton,
                                       Method isOriginal, Method getOriginalUrl) {
         if (data == null || originalButton == null) {
@@ -3478,6 +3593,7 @@ public final class HeyBoxModule extends XposedModule {
                     recordRuntimeFallback("自动加载原图", throwable);
                 } finally {
                     if (!clickFailed && keepRegistered) {
+                        info("IMAGE_ORIGINAL_DISPATCH_OK");
                         // 这里只确认按钮派发恢复，不代表原图下载成功。
                         recordRuntimeSuccess("自动加载原图");
                     }
@@ -3837,6 +3953,7 @@ public final class HeyBoxModule extends XposedModule {
         }
         if (imageEnhanceSnapshot) {
             expected.add("图片增强");
+            expected.add("图片/长图就绪");
         }
         if (postTextSelectSnapshot) {
             expected.add("帖子正文文字选择");

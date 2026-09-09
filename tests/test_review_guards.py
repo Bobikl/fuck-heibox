@@ -10,6 +10,27 @@ def section(start, end):
 
 
 class ReviewGuards(unittest.TestCase):
+    def test_home_only_scoped_refresh_is_blocked(self):
+        body = section("private int installScopedHomeRefresh(", "private void installImageEnhancementHook(")
+        self.assertIn("deoptimize(entry)", body)
+        self.assertIn("previouslyHidden.contains(fragment)", body)
+        self.assertIn("!first.getBoolean(fragment)", body)
+        self.assertIn("suppressHomeVisibilityRefresh.get() == chain.getThisObject()", body)
+        self.assertIn("suppressHomeVisibilityRefresh.set(previous)", body)
+        self.assertNotIn('getDeclaredMethod("onRefresh"', body)
+
+    def test_normal_ready_does_not_hook_url_setter(self):
+        body = section("private void installImageEnhancementHook(", "private void markViewerImageReady(")
+        self.assertNotIn('getMethod("H"', body)
+        self.assertIn('getDeclaredMethod("k", View.class, mediaData)', body)
+
+    def test_long_image_event_not_polling(self):
+        body = section("private void installLongImageReadyHook(", "private void requestOriginalImage(")
+        self.assertIn('getDeclaredMethod("onImageLoaded")', body)
+        self.assertIn("WeakIdentityMap<Object, WeakReference<Object>>", body)
+        self.assertNotIn("postDelayed", body)
+        self.assertNotIn('getDeclaredMethod("onDraw"', body)
+
     def test_host_share_chain_not_replayed(self):
         body = section("private void installTaskShareHook(", "private void installTaskButtonHook(")
         self.assertEqual(body.count("chain.proceed()"), 1)
