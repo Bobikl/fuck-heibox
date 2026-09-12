@@ -10,6 +10,14 @@ def section(start, end):
 
 
 class ReviewGuards(unittest.TestCase):
+    def test_removed_features_have_no_runtime_or_ui_entry(self):
+        ui = (Path(__file__).resolve().parents[1] / "app/src/main/java/dev/heybox/hook/HostSettingsDialog.java").read_text(encoding="utf-8")
+        for token in ("KEY_AD_CLEAN_FEED", "KEY_DISABLE_VIDEO_AUTOPLAY", "RuntimeBridge", "SelfCheck"):
+            self.assertNotIn(token, SOURCE + ui)
+        for token in ("hookFilteredFeedGetter", "feedContentStamp", "installRecommendedVideoAutoplayHooks", "hookGroupProgress"):
+            self.assertNotIn(token, SOURCE)
+        self.assertIn("KEY_DISABLE_GIF_AUTOPLAY", ui)
+
     def test_home_only_scoped_refresh_is_blocked(self):
         body = section("private int installScopedHomeRefresh(", "private void installImageEnhancementHook(")
         self.assertIn("deoptimize(entry)", body)
@@ -38,7 +46,7 @@ class ReviewGuards(unittest.TestCase):
 
     def test_unbound_host_response_not_consumed(self):
         self.assertNotIn("scheduleObservedDailyShareTasks", SOURCE)
-        body = section("hook(consume).intercept", 'recordHookGroup("每日分享任务")')
+        body = section("hook(consume).intercept", 'info("HOOK_DAILY_TASK_OK')
         self.assertIn("triggerDailyShareFetch(classLoader)", body)
         self.assertNotIn("chain.getArg", body)
 
@@ -51,7 +59,7 @@ class ReviewGuards(unittest.TestCase):
         self.assertLess(body.index("hostPreferences.contains(key)"), body.index("editor.putString(key"))
 
     def test_original_skip_does_not_clear_failure(self):
-        body = section("hook(updateOriginal).intercept", 'recordHookGroup("图片增强")')
+        body = section("hook(updateOriginal).intercept", 'info("HOOK_IMAGE_ENHANCE_OK')
         self.assertNotIn("recordRuntimeSuccess", body)
         click = section("private void requestOriginalImage(", "private static boolean hasUsableWifi(")
         self.assertEqual(click.count("recordRuntimeSuccess"), 1)

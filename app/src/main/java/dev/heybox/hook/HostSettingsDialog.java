@@ -20,8 +20,6 @@ import android.widget.LinearLayout;
 import android.widget.ScrollView;
 import android.widget.Switch;
 import android.widget.TextView;
-import java.text.DateFormat;
-import java.util.Date;
 import java.util.Locale;
 
 /**
@@ -31,9 +29,7 @@ import java.util.Locale;
  * 页面只在用户点击设置入口后构建，关闭后不注册监听器或后台任务。</p>
  */
 final class HostSettingsDialog extends Dialog {
-    interface RuntimeBridge {
-        String getSelfCheckReport();
-    }
+
 
     private interface ToggleChangeListener {
         void onChanged(boolean checked);
@@ -48,24 +44,20 @@ final class HostSettingsDialog extends Dialog {
 
     private final Activity host;
     private final SharedPreferences preferences;
-    private final RuntimeBridge runtimeBridge;
     private LinearLayout content;
-    private TextView selfCheckStatus;
     private TextView adCleanValue;
     private View imageAdaptiveContainer;
     private boolean adPage;
 
-    HostSettingsDialog(Activity host, SharedPreferences preferences,
-                       RuntimeBridge runtimeBridge) {
+    HostSettingsDialog(Activity host, SharedPreferences preferences) {
         super(host, android.R.style.Theme_Material_Light_NoActionBar);
         this.host = host;
         this.preferences = preferences;
-        this.runtimeBridge = runtimeBridge;
         migrateMediaAutoplayPreference();
         setOwnerActivity(host);
     }
 
-    /** 旧版合并开关逐字段迁移；不能因其中一个新键已存在而漏掉另一个。 */
+    /** 旧版合并开关仅迁移到保留的 GIF 开关。 */
     private void migrateMediaAutoplayPreference() {
         if (!preferences.contains(Config.KEY_DISABLE_MEDIA_AUTOPLAY)) {
             return;
@@ -73,13 +65,11 @@ final class HostSettingsDialog extends Dialog {
         boolean oldValue = preferences.getBoolean(
                 Config.KEY_DISABLE_MEDIA_AUTOPLAY, false);
         SharedPreferences.Editor editor = preferences.edit();
-        if (!preferences.contains(Config.KEY_DISABLE_VIDEO_AUTOPLAY)) {
-            editor.putBoolean(Config.KEY_DISABLE_VIDEO_AUTOPLAY, oldValue);
-        }
+
         if (!preferences.contains(Config.KEY_DISABLE_GIF_AUTOPLAY)) {
             editor.putBoolean(Config.KEY_DISABLE_GIF_AUTOPLAY, oldValue);
         }
-        // 执行到这里后两个新键都已经存在或将在本次事务中写入。
+        // GIF 键已经存在或将在本次事务中写入，不迁移已删除的视频开关。
         editor.remove(Config.KEY_DISABLE_MEDIA_AUTOPLAY).apply();
     }
 
@@ -143,12 +133,10 @@ final class HostSettingsDialog extends Dialog {
         resetPageReferences();
         setContentView(createMainPage());
         refreshAdCleanValue();
-        refreshSelfCheck();
     }
 
     private void resetPageReferences() {
         content = null;
-        selfCheckStatus = null;
         adCleanValue = null;
         imageAdaptiveContainer = null;
     }
@@ -208,10 +196,6 @@ final class HostSettingsDialog extends Dialog {
                 Config.KEY_POST_TEXT_SELECT, false));
         experienceCard.addView(createDivider());
         experienceCard.addView(createSwitchRow(
-                "禁止推荐视频自动播放", "游戏推荐列表中的视频保留手动播放",
-                Config.KEY_DISABLE_VIDEO_AUTOPLAY, false));
-        experienceCard.addView(createDivider());
-        experienceCard.addView(createSwitchRow(
                 "禁止信息流 GIF 自动播放", "列表中显示静态首帧；点开后自动播放",
                 Config.KEY_DISABLE_GIF_AUTOPLAY, false));
         experienceCard.addView(createDivider());
@@ -256,17 +240,6 @@ final class HostSettingsDialog extends Dialog {
                 ViewGroup.LayoutParams.WRAP_CONTENT);
         noteParams.setMargins(dp(12), dp(10), dp(12), 0);
         content.addView(note, noteParams);
-
-        addSectionLabel("模块自检");
-        LinearLayout selfCheckCard = createCard();
-        selfCheckStatus = createInfoRow("Hook 状态", "正在读取…");
-        selfCheckStatus.setLineSpacing(dp(2), 1f);
-        selfCheckCard.addView(selfCheckStatus);
-        selfCheckCard.addView(createDivider());
-        TextView refresh = createPlainActionRow("刷新自检结果");
-        refresh.setOnClickListener(view -> refreshSelfCheck());
-        selfCheckCard.addView(refresh);
-        content.addView(selfCheckCard, cardMargins());
 
         root.addView(scrollView, new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f));
@@ -342,10 +315,6 @@ final class HostSettingsDialog extends Dialog {
         children.addView(createSectionLabelView("净化项目"));
         LinearLayout childCard = createCard();
         childCard.addView(createSwitchRow(
-                "信息流广告对象", "过滤推荐、关注、话题和合集列表中的广告内容",
-                Config.KEY_AD_CLEAN_FEED, true));
-        childCard.addView(createDivider());
-        childCard.addView(createSwitchRow(
                 "首页气泡、角标、页内广告", "移除首页气泡、角标和页内弹层广告",
                 Config.KEY_AD_CLEAN_HOME, true));
         childCard.addView(createDivider());
@@ -380,7 +349,6 @@ final class HostSettingsDialog extends Dialog {
             return;
         }
         int enabled = 0;
-        enabled += preferences.getBoolean(Config.KEY_AD_CLEAN_FEED, true) ? 1 : 0;
         enabled += preferences.getBoolean(Config.KEY_AD_CLEAN_HOME, true) ? 1 : 0;
         enabled += preferences.getBoolean(Config.KEY_AD_CLEAN_BANNERS, true) ? 1 : 0;
         enabled += preferences.getBoolean(
@@ -388,20 +356,7 @@ final class HostSettingsDialog extends Dialog {
         adCleanValue.setText("已开启 · " + enabled + "项");
     }
 
-    private void refreshSelfCheck() {
-        if (selfCheckStatus == null) {
-            return;
-        }
-        try {
-            String time = DateFormat.getTimeInstance(
-                    DateFormat.MEDIUM, Locale.getDefault()).format(new Date());
-            selfCheckStatus.setText(runtimeBridge.getSelfCheckReport()
-                    + "\n检测时间  " + time);
-        } catch (Throwable throwable) {
-            selfCheckStatus.setText("Hook 状态  自检读取失败\n原因  "
-                    + throwable.getClass().getSimpleName());
-        }
-    }
+
 
     private FrameLayout createTitleBar(String titleText, Runnable backAction) {
         FrameLayout bar = new FrameLayout(host);

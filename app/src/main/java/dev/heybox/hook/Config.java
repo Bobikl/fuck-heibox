@@ -18,9 +18,8 @@ public final class Config {
     /** 每个自然日首次收到任务列表时，自动上报可完成的分享任务。 */
     public static final String KEY_DAILY_SHARE_TASK = "daily_share_task";
     public static final String KEY_SKIP_SPLASH_AD = "skip_splash_ad";
-    /** 广告净化总开关；具体类别由下方四个子项独立控制，开屏由另一开关控制。 */
+    /** 广告净化总开关；具体类别由下方三个子项独立控制，开屏由另一开关控制。 */
     public static final String KEY_GLOBAL_AD_CLEAN = "global_ad_clean";
-    public static final String KEY_AD_CLEAN_FEED = "ad_clean_feed";
     public static final String KEY_AD_CLEAN_HOME = "ad_clean_home";
     public static final String KEY_AD_CLEAN_BANNERS = "ad_clean_banners";
     public static final String KEY_AD_CLEAN_MALL_BOTTOM = "ad_clean_mall_bottom";
@@ -28,7 +27,6 @@ public final class Config {
     public static final String KEY_EXTERNAL_BROWSER = "external_browser";
     /** 0.7.3 及更早版本的视频/GIF合并开关，仅用于一次性兼容迁移。 */
     public static final String KEY_DISABLE_MEDIA_AUTOPLAY = "disable_media_autoplay";
-    public static final String KEY_DISABLE_VIDEO_AUTOPLAY = "disable_video_autoplay";
     public static final String KEY_DISABLE_GIF_AUTOPLAY = "disable_gif_autoplay";
     public static final String KEY_NO_FOREGROUND_REFRESH = "no_foreground_refresh";
     public static final String KEY_IMAGE_ENHANCE = "image_enhance";

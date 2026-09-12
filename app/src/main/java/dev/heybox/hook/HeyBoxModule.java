@@ -134,13 +134,11 @@ public final class HeyBoxModule extends XposedModule {
     private volatile boolean dailyShareTaskSnapshot;
     private volatile boolean skipSplashAdSnapshot;
     private volatile boolean globalAdCleanSnapshot;
-    private volatile boolean adCleanFeedSnapshot;
     private volatile boolean adCleanHomeSnapshot;
     private volatile boolean adCleanBannersSnapshot;
     private volatile boolean adCleanMallBottomSnapshot;
     private volatile boolean disableClipboardTokenSnapshot;
     private volatile boolean externalBrowserSnapshot;
-    private volatile boolean disableVideoAutoplaySnapshot;
     private volatile boolean disableGifAutoplaySnapshot;
     private volatile boolean noForegroundRefreshSnapshot;
     private volatile boolean imageEnhanceSnapshot;
@@ -189,8 +187,6 @@ public final class HeyBoxModule extends XposedModule {
     private volatile Resources centerNavigationResources;
     private volatile int[] centerNavigationIds;
     private String currentProcessName = "";
-    private final Set<String> installedHookGroups = new LinkedHashSet<>();
-    private final Map<String, HookGroupProgress> hookGroupProgress = new LinkedHashMap<>();
     private final Map<String, RuntimeHookState> runtimeHookStates = new LinkedHashMap<>();
     /** Copy-on-write 活动故障名；正常热路径只做无锁空 Set 查询。 */
     private volatile Set<String> activeRuntimeHookNames = Collections.emptySet();
@@ -350,8 +346,7 @@ public final class HeyBoxModule extends XposedModule {
         if (skipSplashAdSnapshot) {
             installSplashAdHook(classLoader);
         }
-        if (globalAdCleanSnapshot && (adCleanFeedSnapshot
-                || adCleanHomeSnapshot
+        if (globalAdCleanSnapshot && (adCleanHomeSnapshot
                 || adCleanBannersSnapshot
                 || adCleanMallBottomSnapshot)) {
             installGlobalAdHooks(classLoader);
@@ -362,7 +357,7 @@ public final class HeyBoxModule extends XposedModule {
         if (externalBrowserSnapshot) {
             installExternalBrowserHooks(classLoader);
         }
-        if (disableVideoAutoplaySnapshot || disableGifAutoplaySnapshot) {
+        if (disableGifAutoplaySnapshot) {
             installMediaAutoplayHooks(classLoader);
         }
         if (noForegroundRefreshSnapshot) {
@@ -459,9 +454,9 @@ public final class HeyBoxModule extends XposedModule {
                 }
                 return result;
             });
-            recordHookGroup("基础/自检");
+
             if (hidePublishSnapshot) {
-                recordHookGroup("隐藏发布按钮");
+
             }
             info("HOOK_UI_CREATE_OK class=" + MAIN_ACTIVITY);
         } catch (Throwable throwable) {
@@ -486,7 +481,7 @@ public final class HeyBoxModule extends XposedModule {
                     triggerDailyShareFetch(classLoader);
                     return result;
                 });
-                recordHookGroup("首页恢复监听");
+
                 info("HOOK_UI_RESUME_OK class=" + MAIN_ACTIVITY);
             } catch (Throwable throwable) {
                 error("HOOK_UI_RESUME_ERROR class=" + MAIN_ACTIVITY, throwable);
@@ -641,7 +636,6 @@ public final class HeyBoxModule extends XposedModule {
                 return chain.proceed();
             });
 
-            recordHookGroup("分享任务入口");
             info("HOOK_SHARE_OK method=" + SHARE_UTIL + ".E(Context,HBShareData)");
         } catch (Throwable throwable) {
             error("HOOK_SHARE_ERROR method=" + SHARE_UTIL + ".E", throwable);
@@ -772,7 +766,6 @@ public final class HeyBoxModule extends XposedModule {
                 return result;
             });
 
-            recordHookGroup("分享任务按钮");
             info("HOOK_TASK_BUTTON_OK method=" + TASK_ADAPTER + ".o(holder,task)");
         } catch (Throwable throwable) {
             error("HOOK_TASK_BUTTON_ERROR method=" + TASK_ADAPTER + ".o", throwable);
@@ -793,7 +786,7 @@ public final class HeyBoxModule extends XposedModule {
                 currentUserIdMethod = accountUtils.getDeclaredMethod("j");
                 loginStateMethod.setAccessible(true);
                 currentUserIdMethod.setAccessible(true);
-                recordHookGroup("每日任务账号");
+
             } catch (Throwable throwable) {
                 loginStateMethod = null;
                 currentUserIdMethod = null;
@@ -817,7 +810,7 @@ public final class HeyBoxModule extends XposedModule {
                 }
                 return result;
             });
-            recordHookGroup("每日分享任务");
+
             info("HOOK_DAILY_TASK_OK method=" + TASK_FRAGMENT + ".n4");
         } catch (Throwable throwable) {
             error("HOOK_DAILY_TASK_ERROR method=" + TASK_FRAGMENT + ".n4", throwable);
@@ -2416,15 +2409,7 @@ public final class HeyBoxModule extends XposedModule {
         }
     }
 
-    private static final class HookGroupProgress {
-        final int installed;
-        final int expected;
 
-        HookGroupProgress(int installed, int expected) {
-            this.installed = installed;
-            this.expected = expected;
-        }
-    }
 
     private static final class RuntimeHookState {
         int failureCount;
@@ -2659,13 +2644,13 @@ public final class HeyBoxModule extends XposedModule {
                 }
             });
             installed++;
-            recordHookGroup("开屏快速路径");
+
             info("HOOK_SPLASH_FAST_OK method=" + SPLASH_ACTIVITY + ".k1");
         } catch (Throwable throwable) {
             warn("HOOK_SPLASH_FAST_SKIP reason="
                     + unwrap(throwable).getClass().getSimpleName());
         }
-        recordHookProgress("开屏广告", installed, 2);
+
         if (installed > 0) {
             info("HOOK_SPLASH_AD_OK methods=" + installed);
         } else {
@@ -2708,40 +2693,10 @@ public final class HeyBoxModule extends XposedModule {
             categoryInstalled += hookConstantNoArgGetter(classLoader,
                     "com.max.xiaoheihe.bean.ads.OverallAdInfo", "getHome_corner_ad", null);
             installed += categoryInstalled;
-            recordHookProgress("广告/首页与页内", categoryInstalled, 6);
+
         }
 
-        if (adCleanFeedSnapshot) {
-            expected += 12;
-            int categoryInstalled = hookEmptyListNoArgGetter(classLoader,
-                    "com.max.xiaoheihe.bean.bbs.FeedsContentAdObj", "getBanners");
-            try {
-                Class<?> feedsAd = Class.forName(
-                        "com.max.xiaoheihe.bean.bbs.FeedsContentAdObj", false, classLoader);
-                String[][] feedGetters = {
-                        {"com.max.xiaoheihe.bean.news.LinkListResultObj", "getLinks"},
-                        {"com.max.xiaoheihe.bean.bbs.BBSTopicLinksObj", "getLinks"},
-                        {"com.max.xiaoheihe.bean.bbs.HashtagLinkListResultObj", "getLinks"},
-                        {"com.max.xiaoheihe.bean.bbs.BBSFollowedMomentsObj", "getMoments"},
-                        {"com.max.xiaoheihe.bean.bbs.ProfileEventResult", "getMoments"},
-                        {"com.max.xiaoheihe.bean.news.SubjectDetailResultOjb", "getNews_list"},
-                        {"com.max.xiaoheihe.bean.news.ConceptFeedsResult", "getLinks"},
-                        {"com.max.xiaoheihe.bean.bbs.BbsRecommendObj", "getLinks"},
-                        {"com.max.xiaoheihe.bean.bbs.CollectionFolder", "getLinks"},
-                        {"com.max.xiaoheihe.bean.bbs.RecallFeedsResult", "getVisible_links"},
-                        {"com.max.xiaoheihe.bean.bbs.RecallFeedsResult", "getUnexposed_links"}
-                };
-                for (String[] target : feedGetters) {
-                    categoryInstalled += hookFilteredFeedGetter(
-                            classLoader, target[0], target[1], feedsAd);
-                }
-            } catch (Throwable throwable) {
-                warn("AD_FEED_CLASS_SKIP reason="
-                        + unwrap(throwable).getClass().getSimpleName());
-            }
-            installed += categoryInstalled;
-            recordHookProgress("广告/信息流对象", categoryInstalled, 12);
-        }
+
 
         if (adCleanBannersSnapshot) {
             expected += 9;
@@ -2762,7 +2717,7 @@ public final class HeyBoxModule extends XposedModule {
                         classLoader, target[0], target[1]);
             }
             installed += categoryInstalled;
-            recordHookProgress("广告/横幅", categoryInstalled, 9);
+
         }
 
         if (adCleanMallBottomSnapshot) {
@@ -2789,10 +2744,9 @@ public final class HeyBoxModule extends XposedModule {
                 warn("AD_MALL_HOOK_SKIP reason="
                         + unwrap(throwable).getClass().getSimpleName());
             }
-            recordHookProgress("广告/商城底栏", categoryInstalled, 1);
+
         }
 
-        recordHookProgress("广告净化", installed, expected);
         if (installed > 0) {
             info("HOOK_GLOBAL_AD_OK methods=" + installed);
         } else {
@@ -2858,114 +2812,19 @@ public final class HeyBoxModule extends XposedModule {
         }
     }
 
-    private static Object filterFeedAds(Object value, Class<?> feedsAdClass) {
-        if (!(value instanceof List<?>)) {
-            return value;
-        }
-        List<?> source = (List<?>) value;
-        boolean containsAd = false;
-        for (Object item : source) {
-            if (item != null && feedsAdClass.isInstance(item)) {
-                containsAd = true;
-                break;
-            }
-        }
-        if (!containsAd) {
-            return value;
-        }
-        ArrayList<Object> filtered = new ArrayList<>(source.size());
-        for (Object item : source) {
-            if (item == null || !feedsAdClass.isInstance(item)) {
-                filtered.add(item);
-            }
-        }
-        return filtered;
-    }
 
-    private static final class FeedFilterCache {
-        final Object source;
-        final int sourceSize;
-        final long contentStamp;
-        final Object filtered;
 
-        FeedFilterCache(Object source, int sourceSize, long contentStamp, Object filtered) {
-            this.source = source;
-            this.sourceSize = sourceSize;
-            this.contentStamp = contentStamp;
-            this.filtered = filtered;
-        }
-    }
+
 
     /** 只使用元素身份生成顺序敏感指纹；对象内部字段变化不影响广告类型判断。 */
-    private static long feedContentStamp(List<?> source) {
-        long stamp = 0xcbf29ce484222325L;
-        for (Object item : source) {
-            stamp ^= item == null ? 0L : System.identityHashCode(item);
-            stamp *= 0x100000001b3L;
-        }
-        return stamp;
-    }
+
 
     /**
      * 同一个结果对象的 getter 会在 RecyclerView 绑定期间被反复调用。按宿主结果对象
      * 缓存过滤结果。列表实例、长度或元素身份/顺序任一变化时重新过滤，避免同一个
      * List 原位 set 后继续返回旧数据；弱键按身份比较，不依赖可变模型的 hashCode。
      */
-    private int hookFilteredFeedGetter(ClassLoader classLoader, String className,
-                                       String methodName, Class<?> feedsAdClass) {
-        try {
-            Class<?> owner = Class.forName(className, false, classLoader);
-            Method getter = owner.getMethod(methodName);
-            if (!getter.getReturnType().isAssignableFrom(ArrayList.class)) {
-                throw new NoSuchMethodException(className + "." + methodName
-                        + " cannot accept filtered ArrayList");
-            }
-            WeakIdentityMap<Object, FeedFilterCache> cache = new WeakIdentityMap<>();
-            hook(getter).intercept(chain -> {
-                Object value = chain.proceed();
-                if (!(value instanceof List<?>)) {
-                    return value;
-                }
-                try {
-                    Object model = chain.getThisObject();
-                    List<?> source = (List<?>) value;
-                    int sourceSize = source.size();
-                    long contentStamp = feedContentStamp(source);
-                    if (model != null) {
-                        synchronized (cache) {
-                            FeedFilterCache cached = cache.get(model);
-                            if (cached != null && cached.source == value
-                                    && cached.sourceSize == sourceSize
-                                    && cached.contentStamp == contentStamp) {
-                                recordRuntimeSuccess("信息流广告过滤");
-                                return cached.filtered;
-                            }
-                        }
-                    }
 
-                    Object filtered = filterFeedAds(value, feedsAdClass);
-                    if (model != null) {
-                        synchronized (cache) {
-                            cache.put(model, new FeedFilterCache(
-                                    value, sourceSize, contentStamp, filtered));
-                        }
-                    }
-                    recordRuntimeSuccess("信息流广告过滤");
-                    return filtered;
-                } catch (Throwable throwable) {
-                    // 宿主列表可能在计算 size/stamp/filter 期间原位更新；任何模块
-                    // 侧异常都直接回退原始返回值，绝不传播到 RecyclerView 绑定链。
-                    recordRuntimeFallback("信息流广告过滤", throwable);
-                    return value;
-                }
-            });
-            return 1;
-        } catch (Throwable throwable) {
-            warn("AD_FEED_GETTER_SKIP method=" + className + "." + methodName
-                    + " reason=" + unwrap(throwable).getClass().getSimpleName());
-            return 0;
-        }
-    }
 
     private void installClipboardTokenHook(ClassLoader classLoader) {
         try {
@@ -2977,7 +2836,7 @@ public final class HeyBoxModule extends XposedModule {
             requireVoidReturn(checkClipboard);
             checkClipboard.setAccessible(true);
             hook(checkClipboard).intercept(chain -> null);
-            recordHookGroup("剪贴板保护");
+
             info("HOOK_CLIPBOARD_TOKEN_OK method=CopyedTokenManager.c");
         } catch (Throwable throwable) {
             error("HOOK_CLIPBOARD_TOKEN_ERROR", throwable);
@@ -3006,7 +2865,7 @@ public final class HeyBoxModule extends XposedModule {
         } catch (Throwable throwable) {
             error("HOOK_EXTERNAL_BROWSER_ERROR", throwable);
         }
-        recordHookProgress("外部浏览器", installed, 3);
+
         if (installed > 0) {
             info("HOOK_EXTERNAL_BROWSER_OK methods=" + installed);
         }
@@ -3025,7 +2884,7 @@ public final class HeyBoxModule extends XposedModule {
                 String url = (String) chain.getArg(1);
                 return openExternalUrl(context, url) ? null : chain.proceed();
             });
-            recordHookGroup("外部浏览器/" + methodName);
+
             return 1;
         } catch (Throwable throwable) {
             warn("EXTERNAL_BROWSER_HOOK_SKIP method=" + methodName + " reason="
@@ -3138,16 +2997,12 @@ public final class HeyBoxModule extends XposedModule {
     private void installMediaAutoplayHooks(ClassLoader classLoader) {
         int installed = 0;
         int expected = 0;
-        if (disableVideoAutoplaySnapshot) {
-            expected += 4;
-            installed += installRecommendedVideoAutoplayHooks(classLoader);
-        }
+
         if (disableGifAutoplaySnapshot) {
             expected++;
             installed += installFeedGifAutoplayHook(classLoader);
         }
 
-        recordHookProgress("媒体防自动播放", installed, expected);
         if (installed > 0) {
             info("HOOK_MEDIA_AUTOPLAY_OK methods=" + installed);
         } else {
@@ -3159,73 +3014,7 @@ public final class HeyBoxModule extends XposedModule {
      * 只截断推荐列表主动寻找可见卡片并播放的入口，播放器和点击播放逻辑保持原样。
      * 相比在 AbsVideoView.play/start 热路径里判断调用来源，这种方式没有全局播放开销。
      */
-    private int installRecommendedVideoAutoplayHooks(ClassLoader classLoader) {
-        int installed = 0;
-        try {
-            Class<?> fragment = Class.forName(
-                    "com.max.xiaoheihe.module.game.GameRecommendV2Fragment",
-                    false, classLoader);
-            Method autoPlayVisibleCard = fragment.getDeclaredMethod("j4");
-            requireVoidReturn(autoPlayVisibleCard);
-            autoPlayVisibleCard.setAccessible(true);
-            hook(autoPlayVisibleCard).intercept(chain -> null);
-            installed++;
-        } catch (Throwable throwable) {
-            warn("MEDIA_VIDEO_V2_HOOK_SKIP reason="
-                    + unwrap(throwable).getClass().getSimpleName());
-        }
 
-        // 深层兜底：V2 当前只有自动扫描传 false，播放按钮传 true。
-        try {
-            Class<?> videoView = Class.forName(
-                    "com.max.xiaoheihe.module.game.component.GameVideoCardView",
-                    false, classLoader);
-            Class<?> videoData = Class.forName(
-                    "com.max.xiaoheihe.bean.game.recommend.GameCardVideoObj",
-                    false, classLoader);
-            Method play = videoView.getDeclaredMethod("l", videoData, boolean.class);
-            requireVoidReturn(play);
-            play.setAccessible(true);
-            hook(play).intercept(chain -> Boolean.FALSE.equals(chain.getArg(1))
-                    ? null : chain.proceed());
-            installed++;
-        } catch (Throwable throwable) {
-            warn("MEDIA_VIDEO_CARD_HOOK_SKIP reason="
-                    + unwrap(throwable).getClass().getSimpleName());
-        }
-
-        // 兼容旧推荐页：滚动后的自动播放在 t4()，首次绑定由适配器布尔标记触发。
-        try {
-            Class<?> legacyFragment = Class.forName(
-                    "com.max.xiaoheihe.module.game.GameMobileRecFragment",
-                    false, classLoader);
-            Method autoPlayAfterScroll = legacyFragment.getDeclaredMethod("t4", int.class);
-            requireVoidReturn(autoPlayAfterScroll);
-            autoPlayAfterScroll.setAccessible(true);
-            hook(autoPlayAfterScroll).intercept(chain -> null);
-            installed++;
-
-            Class<?> legacyAdapter = Class.forName(
-                    "com.max.xiaoheihe.module.game.GameMobileRecFragment$f",
-                    false, classLoader);
-            Constructor<?> constructor = legacyAdapter.getDeclaredConstructor(legacyFragment);
-            Field firstAutoPlay = legacyAdapter.getDeclaredField("f84523b");
-            constructor.setAccessible(true);
-            firstAutoPlay.setAccessible(true);
-            hook(constructor).intercept(chain -> {
-                Object result = chain.proceed();
-                firstAutoPlay.setBoolean(chain.getThisObject(), false);
-                return result;
-            });
-            installed++;
-        } catch (Throwable throwable) {
-            warn("MEDIA_VIDEO_LEGACY_HOOK_SKIP reason="
-                    + unwrap(throwable).getClass().getSimpleName());
-        }
-
-        recordHookProgress("媒体/推荐视频", installed, 4);
-        return installed;
-    }
 
     /** 列表加载器静止 GIF；全屏查看器使用另一套加载器，因此点开后仍会自动播放。 */
     private int installFeedGifAutoplayHook(ClassLoader classLoader) {
@@ -3261,10 +3050,10 @@ public final class HeyBoxModule extends XposedModule {
                 }
                 return chain.proceed(arguments);
             });
-            recordHookProgress("媒体/GIF列表", 1, 1);
+
             return 1;
         } catch (Throwable throwable) {
-            recordHookProgress("媒体/GIF列表", 0, 1);
+
             warn("MEDIA_GIF_HOOK_SKIP reason="
                     + unwrap(throwable).getClass().getSimpleName());
             return 0;
@@ -3302,7 +3091,7 @@ public final class HeyBoxModule extends XposedModule {
                 "com.max.xiaoheihe.module.news.NewsTagListFragment", "onHiddenChanged", true);
         installed += installScopedHomeRefresh(loader,
                 "com.max.xiaoheihe.module.bbs.HotNewsFragment", "onFragmentShow", false);
-        recordHookProgress("阻止返回首页自动刷新", installed, 4);
+
         info("HOOK_HOME_RETURN_REFRESH_OK methods=" + installed + " strategy=scoped_visibility_v2");
     }
 
@@ -3458,7 +3247,7 @@ public final class HeyBoxModule extends XposedModule {
                 }
                 return result;
             });
-            recordHookGroup("图片增强");
+
             info("HOOK_IMAGE_ENHANCE_OK method=BaseResUICustomizer.y/K+HBImageLoader.k+long_ready");
         } catch (Throwable throwable) {
             error("HOOK_IMAGE_ENHANCE_ERROR", throwable);
@@ -3544,7 +3333,7 @@ public final class HeyBoxModule extends XposedModule {
         } catch (Throwable error) {
             warn("HOOK_LONG_IMAGE_READY_SKIP reason=" + unwrap(error).getClass().getSimpleName());
         }
-        recordHookProgress("图片/长图就绪", installed, 2);
+
     }
 
     /** 按当前页懒加载，排到加载回调后执行，仍在点击前校验当前页及网络。 */
@@ -3686,7 +3475,7 @@ public final class HeyBoxModule extends XposedModule {
                 }
                 return result;
             });
-            recordHookGroup("帖子正文文字选择");
+
             info("HOOK_POST_TEXT_SELECT_OK method=PostUtils.Companion.a");
         } catch (Throwable throwable) {
             error("HOOK_POST_TEXT_SELECT_ERROR", throwable);
@@ -3753,7 +3542,7 @@ public final class HeyBoxModule extends XposedModule {
                 }
                 return result;
             });
-            recordHookGroup("设置入口");
+
             info("HOOK_SETTINGS_OK method=" + TARGET_SETTINGS_ACTIVITY + ".k1");
         } catch (Throwable throwable) {
             error("HOOK_SETTINGS_ERROR class=" + TARGET_SETTINGS_ACTIVITY, throwable);
@@ -3804,15 +3593,7 @@ public final class HeyBoxModule extends XposedModule {
             if (activity.isFinishing() || activity.isDestroyed()) {
                 return;
             }
-            HostSettingsDialog dialog = new HostSettingsDialog(
-                    activity,
-                    preferences,
-                    new HostSettingsDialog.RuntimeBridge() {
-                        @Override
-                        public String getSelfCheckReport() {
-                            return buildEmbeddedSelfCheckReport();
-                        }
-                    });
+            HostSettingsDialog dialog = new HostSettingsDialog(activity, preferences);
             dialog.show();
             info("SETTINGS_OPEN_OK mode=host_dialog");
         } catch (Throwable throwable) {
@@ -3823,147 +3604,9 @@ public final class HeyBoxModule extends XposedModule {
         }
     }
 
-    private String buildEmbeddedSelfCheckReport() {
-        Set<String> installed;
-        synchronized (installedHookGroups) {
-            installed = new LinkedHashSet<>(installedHookGroups);
-        }
-        Map<String, HookGroupProgress> progress;
-        synchronized (hookGroupProgress) {
-            progress = new LinkedHashMap<>(hookGroupProgress);
-        }
-        List<String> activeRuntimeFailures = new ArrayList<>();
-        List<String> recoveredRuntimeFailures = new ArrayList<>();
-        synchronized (runtimeHookStates) {
-            for (Map.Entry<String, RuntimeHookState> entry : runtimeHookStates.entrySet()) {
-                RuntimeHookState state = entry.getValue();
-                String detail = entry.getKey() + "（" + state.lastException
-                        + "，累计 " + state.failureCount + " 次）";
-                if (state.active) {
-                    activeRuntimeFailures.add(detail);
-                } else if (state.recovered) {
-                    recoveredRuntimeFailures.add(detail);
-                }
-            }
-        }
-        List<String> missing = new ArrayList<>();
-        List<String> partial = new ArrayList<>();
-        for (String expected : expectedHookGroups()) {
-            HookGroupProgress group = progress.get(expected);
-            if (group != null && group.installed == 0) {
-                missing.add(expected + " 0/" + group.expected);
-            } else if (group != null && group.installed < group.expected) {
-                partial.add(expected + " " + group.installed + "/" + group.expected);
-            } else if (group == null && !installed.contains(expected)) {
-                missing.add(expected);
-            }
-        }
-        String enabled = enabledFeatureSummary();
-        boolean installationComplete = missing.isEmpty() && partial.isEmpty();
-        String runtimeStatus = activeRuntimeFailures.isEmpty()
-                ? (recoveredRuntimeFailures.isEmpty() ? "正常" : "曾发生异常，现已恢复")
-                : activeRuntimeFailures.size() + " 项当前异常";
-        List<String> progressDetails = new ArrayList<>();
-        for (Map.Entry<String, HookGroupProgress> entry : progress.entrySet()) {
-            HookGroupProgress value = entry.getValue();
-            progressDetails.add(entry.getKey() + " " + value.installed
-                    + "/" + value.expected);
-        }
-        return "Hook 安装状态  "
-                + (installationComplete ? "完整" : "部分缺失")
-                + "\n运行状态  " + runtimeStatus
-                + "\n模块版本  " + MODULE_VERSION
-                + "\n目标版本  " + readTargetVersion(targetContext)
-                + "\n目标进程  " + currentProcessName
-                + "\n已安装组  " + (installed.isEmpty()
-                ? "无" : String.join("、", installed))
-                + "\n安装计数  " + (progressDetails.isEmpty()
-                ? "无" : String.join("、", progressDetails))
-                + "\n缺失组  " + (missing.isEmpty()
-                ? "无" : String.join("、", missing))
-                + "\n部分安装  " + (partial.isEmpty()
-                ? "无" : String.join("、", partial))
-                + "\n当前运行异常  " + (activeRuntimeFailures.isEmpty()
-                ? "无" : String.join("、", activeRuntimeFailures))
-                + "\n已恢复异常  " + (recoveredRuntimeFailures.isEmpty()
-                ? "无" : String.join("、", recoveredRuntimeFailures))
-                + "\n本次进程已启用  " + (enabled.isEmpty() ? "无" : enabled);
-    }
 
-    private Set<String> expectedHookGroups() {
-        Set<String> expected = new LinkedHashSet<>();
-        expected.add("设置入口");
-        if (hidePublishSnapshot || (shareTaskSnapshot && dailyShareTaskSnapshot)) {
-            expected.add("基础/自检");
-            expected.add("首页恢复监听");
-        }
-        if (hidePublishSnapshot) {
-            expected.add("隐藏发布按钮");
-        }
-        if (shareTaskSnapshot) {
-            expected.add("分享任务入口");
-            expected.add("分享任务按钮");
-        }
-        if (shareTaskSnapshot && dailyShareTaskSnapshot) {
-            expected.add("每日分享任务");
-            expected.add("每日任务账号");
-        }
-        if (skipSplashAdSnapshot) {
-            expected.add("开屏广告");
-            expected.add("开屏快速路径");
-        }
-        if (globalAdCleanSnapshot) {
-            if (adCleanFeedSnapshot) {
-                expected.add("广告/信息流对象");
-            }
-            if (adCleanHomeSnapshot) {
-                expected.add("广告/首页与页内");
-            }
-            if (adCleanBannersSnapshot) {
-                expected.add("广告/横幅");
-            }
-            if (adCleanMallBottomSnapshot) {
-                expected.add("广告/商城底栏");
-            }
-            if (adCleanFeedSnapshot || adCleanHomeSnapshot
-                    || adCleanBannersSnapshot || adCleanMallBottomSnapshot) {
-                expected.add("广告净化");
-            }
-        }
-        if (disableClipboardTokenSnapshot) {
-            expected.add("剪贴板保护");
-        }
-        if (externalBrowserSnapshot) {
-            expected.add("外部浏览器");
-            expected.add("外部浏览器/j0");
-            expected.add("外部浏览器/k0");
-            expected.add("外部浏览器/l0");
-        }
-        if (disableVideoAutoplaySnapshot || disableGifAutoplaySnapshot) {
-            expected.add("媒体防自动播放");
-        }
-        if (disableVideoAutoplaySnapshot) {
-            expected.add("媒体/推荐视频");
-        }
-        if (disableGifAutoplaySnapshot) {
-            expected.add("媒体/GIF列表");
-        }
-        if (noForegroundRefreshSnapshot) {
-            expected.add("阻止返回首页自动刷新");
-        }
-        if (imageEnhanceSnapshot) {
-            expected.add("图片增强");
-            expected.add("图片/长图就绪");
-        }
-        if (postTextSelectSnapshot) {
-            expected.add("帖子正文文字选择");
-        }
-        if (suppressUpdatePromptSnapshot) {
-            expected.add("更新响应");
-            expected.add("更新弹窗");
-        }
-        return expected;
-    }
+
+
 
     private ViewGroup.LayoutParams copyLayoutParams(ViewGroup.LayoutParams source) {
         if (source == null) {
@@ -4040,7 +3683,7 @@ public final class HeyBoxModule extends XposedModule {
             warn("HOOK_UPDATE_RESPONSE_SKIP method=onError reason="
                     + unwrap(throwable).getClass().getSimpleName());
         }
-        recordHookProgress("更新响应", installed, expected);
+
         info("HOOK_UPDATE_RESPONSE_READY methods=" + installed);
     }
 
@@ -4076,7 +3719,7 @@ public final class HeyBoxModule extends XposedModule {
                     "com.max.xiaoheihe.utils.AppUpdateManager", false, classLoader);
             appUpdateCheckMethod = updateManager.getMethod("r", Context.class);
             appUpdateCheckMethod.setAccessible(true);
-            recordHookGroup("版本检测");
+
             info("VERSION_CHECK_READY method=AppUpdateManager.r");
         } catch (Throwable throwable) {
             error("VERSION_CHECK_PREPARE_ERROR", throwable);
@@ -4235,7 +3878,7 @@ public final class HeyBoxModule extends XposedModule {
                 }
                 return chain.proceed();
             });
-            recordHookGroup("版本响应");
+
             info("HOOK_VERSION_RESPONSE_OK class=" + CHECK_VERSION_OBJECT);
         } catch (Throwable throwable) {
             error("HOOK_VERSION_RESPONSE_ERROR class=" + CHECK_VERSION_OBJECT, throwable);
@@ -4337,7 +3980,7 @@ public final class HeyBoxModule extends XposedModule {
         } catch (Throwable throwable) {
             error("HOOK_UPDATE_PROMPT_ERROR", throwable);
         }
-        recordHookProgress("更新弹窗", installed, 4);
+
         if (installed > 0) {
             info("HOOK_UPDATE_PROMPT_OK methods=" + installed);
         }
@@ -4356,7 +3999,7 @@ public final class HeyBoxModule extends XposedModule {
                 info("UPDATE_PROMPT_SUPPRESSED method=AppUpdateManager." + methodName);
                 return null;
             });
-            recordHookGroup("更新弹窗/" + methodName);
+
             return 1;
         } catch (Throwable throwable) {
             warn("HOOK_UPDATE_PROMPT_SKIP method=AppUpdateManager." + methodName
@@ -4374,7 +4017,7 @@ public final class HeyBoxModule extends XposedModule {
                 Object result = chain.proceed();
                 return resolveSpoofVersion(stringValue(result));
             });
-            recordHookGroup("版本伪装");
+
             info("HOOK_VERSION_UTIL_OK method=com.max.xiaoheihe.utils.d.x0");
         } catch (Throwable throwable) {
             error("HOOK_VERSION_UTIL_ERROR method=com.max.xiaoheihe.utils.d.x0", throwable);
@@ -4412,7 +4055,7 @@ public final class HeyBoxModule extends XposedModule {
                 long resolved = resolveSpoofVersionCode(real);
                 return resolved > 0L ? String.valueOf(resolved) : result;
             });
-            recordHookGroup("版本Code读取");
+
             info("HOOK_VERSION_CODE_UTIL_OK method=router.serviceimpl.b.o");
         } catch (Throwable throwable) {
             error("HOOK_VERSION_CODE_UTIL_ERROR method=router.serviceimpl.b.o", throwable);
@@ -4477,7 +4120,7 @@ public final class HeyBoxModule extends XposedModule {
                 }
                 return result;
             });
-            recordHookGroup("网络版本参数");
+
             info("HOOK_NETWORK_VERSION_OK method=router.serviceimpl.i.b params=version,build"
                     + " replace=" + (replaceQuery != null));
         } catch (Throwable throwable) {
@@ -4559,7 +4202,7 @@ public final class HeyBoxModule extends XposedModule {
                 }
             }
             if (installed > 0) {
-                recordHookGroup("PackageInfo版本");
+
                 info("HOOK_PACKAGE_INFO_OK overloads=" + installed);
             } else {
                 warn("HOOK_PACKAGE_INFO_EMPTY");
@@ -4766,8 +4409,6 @@ public final class HeyBoxModule extends XposedModule {
         dailyShareTaskSnapshot = isEnabled(Config.KEY_DAILY_SHARE_TASK, false);
         skipSplashAdSnapshot = isEnabled(Config.KEY_SKIP_SPLASH_AD, false);
         globalAdCleanSnapshot = isEnabled(Config.KEY_GLOBAL_AD_CLEAN, false);
-        adCleanFeedSnapshot = globalAdCleanSnapshot
-                && isEnabled(Config.KEY_AD_CLEAN_FEED, true);
         adCleanHomeSnapshot = globalAdCleanSnapshot
                 && isEnabled(Config.KEY_AD_CLEAN_HOME, true);
         adCleanBannersSnapshot = globalAdCleanSnapshot
@@ -4781,10 +4422,6 @@ public final class HeyBoxModule extends XposedModule {
         // 打开设置页时也读取旧值，避免升级后的第一次宿主启动出现配置失效。
         boolean legacyMediaAutoplay = isEnabled(
                 Config.KEY_DISABLE_MEDIA_AUTOPLAY, false);
-        disableVideoAutoplaySnapshot = preferences.contains(
-                Config.KEY_DISABLE_VIDEO_AUTOPLAY)
-                ? isEnabled(Config.KEY_DISABLE_VIDEO_AUTOPLAY, false)
-                : legacyMediaAutoplay;
         disableGifAutoplaySnapshot = preferences.contains(
                 Config.KEY_DISABLE_GIF_AUTOPLAY)
                 ? isEnabled(Config.KEY_DISABLE_GIF_AUTOPLAY, false)
@@ -4806,13 +4443,12 @@ public final class HeyBoxModule extends XposedModule {
                 + " daily_share=" + dailyShareTaskSnapshot
                 + " splash=" + skipSplashAdSnapshot
                 + " global_ads=" + globalAdCleanSnapshot
-                + "[feed=" + adCleanFeedSnapshot
-                + ",home=" + adCleanHomeSnapshot
+                + "[home=" + adCleanHomeSnapshot
                 + ",banners=" + adCleanBannersSnapshot
                 + ",mall_bottom=" + adCleanMallBottomSnapshot + "]"
                 + " clipboard=" + disableClipboardTokenSnapshot
                 + " external_browser=" + externalBrowserSnapshot
-                + " video_autoplay=" + disableVideoAutoplaySnapshot
+
                 + " gif_autoplay=" + disableGifAutoplaySnapshot
                 + " no_foreground_refresh=" + noForegroundRefreshSnapshot
                 + " image_enhance=" + imageEnhanceSnapshot
@@ -5165,22 +4801,9 @@ public final class HeyBoxModule extends XposedModule {
         return throwable;
     }
 
-    private void recordHookGroup(String group) {
-        synchronized (installedHookGroups) {
-            installedHookGroups.add(group);
-        }
-    }
 
-    private void recordHookProgress(String group, int installed, int expected) {
-        HookGroupProgress progress = new HookGroupProgress(
-                Math.max(0, installed), Math.max(1, expected));
-        synchronized (hookGroupProgress) {
-            hookGroupProgress.put(group, progress);
-        }
-        if (installed > 0) {
-            recordHookGroup(group);
-        }
-    }
+
+
 
     /** 运行异常按 Hook 名聚合；同一 Hook 后续成功时可以恢复健康状态。 */
     private void recordRuntimeFallback(String hook, Throwable throwable) {
@@ -5243,75 +4866,9 @@ public final class HeyBoxModule extends XposedModule {
         }
     }
 
-    private static String readTargetVersion(Context context) {
-        try {
-            PackageInfo packageInfo = context.getPackageManager()
-                    .getPackageInfo(TARGET_PACKAGE, 0);
-            return stringValue(packageInfo.versionName)
-                    + " (" + getPackageVersionCode(packageInfo) + ")";
-        } catch (Throwable ignored) {
-            return "未知";
-        }
-    }
 
-    private String enabledFeatureSummary() {
-        List<String> enabled = new ArrayList<>();
-        if (hidePublishSnapshot) {
-            enabled.add("隐藏发布按钮");
-        }
-        if (globalAdCleanSnapshot) {
-            List<String> adGroups = new ArrayList<>(4);
-            if (adCleanFeedSnapshot) {
-                adGroups.add("信息流");
-            }
-            if (adCleanHomeSnapshot) {
-                adGroups.add("首页/页内");
-            }
-            if (adCleanBannersSnapshot) {
-                adGroups.add("横幅");
-            }
-            if (adCleanMallBottomSnapshot) {
-                adGroups.add("商城底栏");
-            }
-            enabled.add("广告净化[" + (adGroups.isEmpty()
-                    ? "无子项" : String.join("/", adGroups)) + "]");
-        }
-        if (skipSplashAdSnapshot) {
-            enabled.add("跳过开屏广告");
-        }
-        if (disableClipboardTokenSnapshot) {
-            enabled.add("剪贴板保护");
-        }
-        if (shareTaskSnapshot) {
-            enabled.add("分享任务");
-        }
-        if (shareTaskSnapshot && dailyShareTaskSnapshot) {
-            enabled.add("每日任务");
-        }
-        if (externalBrowserSnapshot) {
-            enabled.add("外部浏览器");
-        }
-        if (disableVideoAutoplaySnapshot) {
-            enabled.add("推荐视频不自动播放");
-        }
-        if (disableGifAutoplaySnapshot) {
-            enabled.add("信息流GIF静止");
-        }
-        if (noForegroundRefreshSnapshot) {
-            enabled.add("禁止返回首页自动刷新");
-        }
-        if (imageEnhanceSnapshot) {
-            enabled.add(imageWifiAdaptiveSnapshot
-                    ? "图片增强[仅Wi-Fi]" : "图片增强");
-        }
-        if (postTextSelectSnapshot) {
-            enabled.add("帖子正文文字选择");
-        }
-        if (suppressUpdatePromptSnapshot) {
-            enabled.add("屏蔽更新弹窗");
-        }
-        return String.join("、", enabled);
-    }
+
+
 
     private void info(String message) {
         Log.i(TAG, message);
