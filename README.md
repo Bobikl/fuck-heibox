@@ -4,8 +4,6 @@
 
 当前版本：`0.8.5`（versionCode `38`），固定签名本地测试版，未发布。
 
-发布流程：每批更改先推送源码。APK 必须由用户测试并明确允许后再上传 GitHub Releases，不自动发布构建产物。
-
 主要功能：
 
 - 首页隐藏底部发布按钮
@@ -42,9 +40,6 @@ gradle :app:assembleRelease --no-daemon
 ```text
 app/build/outputs/apk/release/app-release.apk
 ```
-
-正式发布必须提供固定 Release 签名；缺少签名配置时只会生成 unsigned Release，
-不会回退到 debug key。配置方法及证书指纹见 [`SIGNING.md`](SIGNING.md)。
 
 ## 静态分析资料
 
