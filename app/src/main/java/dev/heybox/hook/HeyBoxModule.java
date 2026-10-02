@@ -114,6 +114,8 @@ public final class HeyBoxModule extends XposedModule {
     private boolean hooksInstalled;
     private boolean hooksInitializing;
     private SharedPreferences preferences;
+    private final SafePreferences safePreferences = new SafePreferences(this::warn);
+    private HostSettingsDialogs settingsDialogs;
     private volatile Context targetContext;
     private volatile WeakReference<Activity> lastTargetActivity = new WeakReference<>(null);
     private Method appUpdateCheckMethod;
@@ -373,61 +375,22 @@ public final class HeyBoxModule extends XposedModule {
     }
 
     private void migrateRemotePreferencesIfNeeded(SharedPreferences hostPreferences) {
-        if (hostPreferences.getBoolean(Config.KEY_HOST_PREFS_MIGRATED, false)) {
+        if (safePreferences.getBoolean(
+                hostPreferences, Config.KEY_HOST_PREFS_MIGRATED, false)) {
             return;
         }
-        SharedPreferences.Editor editor = hostPreferences.edit();
-        int migrated = 0;
-        SharedPreferences legacy = null;
+        final SharedPreferences legacy;
         try {
-            // 仅首次迁移进入这里。迁移标记写入后，后续进程启动不会再创建
-            // LSPosed Remote Preferences 连接。
             legacy = getRemotePreferences(Config.PREFS_NAME);
         } catch (Throwable throwable) {
             warn("HOST_CONFIG_MIGRATION_OPEN_ERROR "
                     + unwrap(throwable).getClass().getSimpleName());
-            // 不写迁移完成标记，下次启动仍有机会读取旧配置。
             return;
         }
-        if (legacy != null) {
-            try {
-                for (Map.Entry<String, ?> entry : legacy.getAll().entrySet()) {
-                    Object value = entry.getValue();
-                    String key = entry.getKey();
-                    // 迁移重试不得覆盖用户已在宿主设置页保存的新值。
-                    if (hostPreferences.contains(key)) {
-                        continue;
-                    }
-                    if (value instanceof String) {
-                        editor.putString(key, (String) value);
-                    } else if (value instanceof Boolean) {
-                        editor.putBoolean(key, (Boolean) value);
-                    } else if (value instanceof Integer) {
-                        editor.putInt(key, (Integer) value);
-                    } else if (value instanceof Long) {
-                        editor.putLong(key, (Long) value);
-                    } else if (value instanceof Float) {
-                        editor.putFloat(key, (Float) value);
-                    } else if (value instanceof Set<?>) {
-                        @SuppressWarnings("unchecked")
-                        Set<String> values = (Set<String>) value;
-                        editor.putStringSet(key, new LinkedHashSet<>(values));
-                    } else {
-                        continue;
-                    }
-                    migrated++;
-                }
-            } catch (Throwable throwable) {
-                warn("HOST_CONFIG_MIGRATION_READ_ERROR "
-                        + throwable.getClass().getSimpleName());
-                // 读取失败时不把空配置标记成迁移完成。
-                return;
-            }
+        int migrated = safePreferences.migrate(hostPreferences, legacy);
+        if (migrated >= 0) {
+            info("HOST_CONFIG_MIGRATED count=" + migrated);
         }
-        // SharedPreferences.apply() 会立即更新当前进程内存值，并异步落盘，避免在
-        // Application 启动主线程上执行同步 fsync。
-        editor.putBoolean(Config.KEY_HOST_PREFS_MIGRATED, true).apply();
-        info("HOST_CONFIG_MIGRATED count=" + migrated);
     }
 
     private void installMainUiHooks(ClassLoader classLoader) {
@@ -2576,7 +2539,11 @@ public final class HeyBoxModule extends XposedModule {
             Class<?> selectorClass = Class.forName(
                     OPEN_SCREEN_AD_SELECTOR, false, classLoader);
             Method selectAd = selectorClass.getDeclaredMethod("g", boolean.class);
-            requireNullableReturn(selectAd);
+            if (!Modifier.isStatic(selectAd.getModifiers())
+                    || !selectAd.getReturnType().getName().equals(
+                            "com.max.xiaoheihe.bean.AdsInfoObj")) {
+                throw new NoSuchMethodException("Unexpected splash selector contract");
+            }
             selectAd.setAccessible(true);
             hook(selectAd).intercept(chain -> {
                 info("SPLASH_AD_BYPASS launch=" + chain.getArg(0));
@@ -2589,68 +2556,8 @@ public final class HeyBoxModule extends XposedModule {
                     + unwrap(throwable).getClass().getSimpleName());
         }
 
-        try {
-            Class<?> splashClass = Class.forName(SPLASH_ACTIVITY, false, classLoader);
-            Method splashInitialize = findInheritedMethod(splashClass, "k1");
-            Method continueLaunch = splashClass.getMethod("Y1", boolean.class);
-            requireVoidReturn(splashInitialize);
-            requireVoidReturn(continueLaunch);
-            Field adBindingField = splashClass.getSuperclass().getDeclaredField("O");
-            Class<?> adBindingClass = Class.forName("df.e", false, classLoader);
-            Constructor<?> emptyBindingConstructor = null;
-            for (Constructor<?> constructor : adBindingClass.getDeclaredConstructors()) {
-                boolean referencesOnly = true;
-                for (Class<?> parameter : constructor.getParameterTypes()) {
-                    if (parameter.isPrimitive()) {
-                        referencesOnly = false;
-                        break;
-                    }
-                }
-                if (referencesOnly && constructor.getParameterCount() == 12) {
-                    emptyBindingConstructor = constructor;
-                    break;
-                }
-            }
-            if (emptyBindingConstructor == null) {
-                throw new NoSuchMethodException("df.e reference-only constructor");
-            }
-            splashInitialize.setAccessible(true);
-            continueLaunch.setAccessible(true);
-            adBindingField.setAccessible(true);
-            emptyBindingConstructor.setAccessible(true);
-            final Constructor<?> bindingConstructor = emptyBindingConstructor;
-
-            // 比“让广告选择器返回 null”更快：不再创建和绑定广告页面，直接进入
-            // SplashActivity 原本的无广告启动分支。隐私协议、登录态和初始化逻辑仍保留。
-            hook(splashInitialize).intercept(chain -> {
-                Activity splash = (Activity) chain.getThisObject();
-                targetContext = splash.getApplicationContext();
-                try {
-                    // AdsActivity.onDestroy() 只读取 O.j。提前写入全空轻量 binding，
-                    // 避免为了销毁流程在主线程 inflate 整套广告布局。
-                    if (adBindingField.get(splash) == null) {
-                        adBindingField.set(splash, bindingConstructor.newInstance(
-                                new Object[bindingConstructor.getParameterCount()]));
-                    }
-                    continueLaunch.invoke(splash, false);
-                    info("SPLASH_FAST_BYPASS");
-                    recordRuntimeSuccess("开屏快速路径");
-                    return null;
-                } catch (Throwable throwable) {
-                    // 目标结构变化时回退原初始化；选择器兼容 Hook 若已安装，
-                    // 仍会让宿主走原生无广告分支。
-                    recordRuntimeFallback("开屏快速路径", throwable);
-                    return chain.proceed();
-                }
-            });
-            installed++;
-
-            info("HOOK_SPLASH_FAST_OK method=" + SPLASH_ACTIVITY + ".k1");
-        } catch (Throwable throwable) {
-            warn("HOOK_SPLASH_FAST_SKIP reason="
-                    + unwrap(throwable).getClass().getSimpleName());
-        }
-
+        // 保留宿主创建真实布局和 binding 的初始化过程，不构造空 binding，
+        // 不手动调用 Y1，也不在发生部分副作用后重放启动流程。
         if (installed > 0) {
             info("HOOK_SPLASH_AD_OK methods=" + installed);
         } else {
@@ -3482,19 +3389,6 @@ public final class HeyBoxModule extends XposedModule {
         }
     }
 
-    private static Method findInheritedMethod(Class<?> type, String name,
-                                               Class<?>... parameterTypes)
-            throws NoSuchMethodException {
-        for (Class<?> current = type; current != null; current = current.getSuperclass()) {
-            try {
-                return current.getDeclaredMethod(name, parameterTypes);
-            } catch (NoSuchMethodException ignored) {
-                // 继续检查父类。
-            }
-        }
-        throw new NoSuchMethodException(type.getName() + "." + name);
-    }
-
     private static void requireVoidReturn(Method method) throws NoSuchMethodException {
         if (method.getReturnType() != void.class) {
             throw new NoSuchMethodException(method.getDeclaringClass().getName()
@@ -3593,8 +3487,11 @@ public final class HeyBoxModule extends XposedModule {
             if (activity.isFinishing() || activity.isDestroyed()) {
                 return;
             }
-            HostSettingsDialog dialog = new HostSettingsDialog(activity, preferences);
-            dialog.show();
+            if (settingsDialogs == null) {
+                settingsDialogs = new HostSettingsDialogs(activity.getApplication(),
+                        preferences, safePreferences, this::warn);
+            }
+            settingsDialogs.open(activity);
             info("SETTINGS_OPEN_OK mode=host_dialog");
         } catch (Throwable throwable) {
             error("SETTINGS_OPEN_ERROR", throwable);
@@ -4420,12 +4317,7 @@ public final class HeyBoxModule extends XposedModule {
         externalBrowserSnapshot = isEnabled(Config.KEY_EXTERNAL_BROWSER, false);
         // 0.7.3 及更早版本只有一个媒体开关。设置页会一次性迁移；在用户尚未
         // 打开设置页时也读取旧值，避免升级后的第一次宿主启动出现配置失效。
-        boolean legacyMediaAutoplay = isEnabled(
-                Config.KEY_DISABLE_MEDIA_AUTOPLAY, false);
-        disableGifAutoplaySnapshot = preferences.contains(
-                Config.KEY_DISABLE_GIF_AUTOPLAY)
-                ? isEnabled(Config.KEY_DISABLE_GIF_AUTOPLAY, false)
-                : legacyMediaAutoplay;
+        disableGifAutoplaySnapshot = safePreferences.getGifBoolean(preferences);
         noForegroundRefreshSnapshot = isEnabled(
                 Config.KEY_NO_FOREGROUND_REFRESH, false);
         imageEnhanceSnapshot = isEnabled(Config.KEY_IMAGE_ENHANCE, false);
@@ -4462,12 +4354,8 @@ public final class HeyBoxModule extends XposedModule {
     }
 
     private boolean isEnabled(String key, boolean defaultValue) {
-        try {
-            return preferences == null ? defaultValue
-                    : preferences.getBoolean(key, defaultValue);
-        } catch (Throwable throwable) {
-            return defaultValue;
-        }
+        return preferences == null ? defaultValue
+                : safePreferences.getBoolean(preferences, key, defaultValue);
     }
 
     private String getPreferenceString(String key, String defaultValue) {

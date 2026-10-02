@@ -31,8 +31,8 @@ android {
         applicationId = "dev.heybox.hook"
         minSdk = 26
         targetSdk = 35
-        versionCode = 37
-        versionName = "0.8.4"
+        versionCode = 38
+        versionName = "0.8.5"
     }
 
     val fixedReleaseSigning = if (releaseSigningConfigured) {
@@ -80,4 +80,10 @@ android {
 
 dependencies {
     compileOnly("io.github.libxposed:api:102.0.0")
+    testImplementation("junit:junit:4.13.2")
+}
+
+// 源码编码与系统区域设置无关，包含中文注释及文案。
+tasks.withType<JavaCompile>().configureEach {
+    options.encoding = "UTF-8"
 }

@@ -2,7 +2,7 @@
 
 小黑盒 LSPosed 模块，使用现代 Xposed API（API 102）开发。
 
-当前版本：`0.8.4`（versionCode `37`），正式签名 Release。
+当前版本：`0.8.5`（versionCode `38`），固定签名本地测试版，未发布。
 
 发布流程：每批更改先推送源码。APK 必须由用户测试并明确允许后再上传 GitHub Releases，不自动发布构建产物。
 
@@ -51,3 +51,5 @@ app/build/outputs/apk/release/app-release.apk
 `jadx_src/` 保存适配基准 APK 的完整 JADX 反编译快照，包含应用源码、依赖库和混淆包，详情参见 [`jadx_src/README.md`](jadx_src/README.md)。该目录仅用于 Hook 定位和版本适配，不参与模块构建。
 
 本仓库跟踪模块源码、反编译分析资料、资源和构建配置，不提交 `build`、`.gradle`、本地 SDK 配置和 APK 文件。正式 APK 通过 GitHub Releases 发布。
+
+本轮稳定性修复范围与测试入口见 [0.8.5 第一批验证记录](docs/review-batch1-0.8.5.md)。

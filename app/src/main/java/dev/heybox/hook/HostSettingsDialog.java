@@ -20,6 +20,7 @@ import android.widget.LinearLayout;
 import android.widget.ScrollView;
 import android.widget.Switch;
 import android.widget.TextView;
+import android.widget.Toast;
 import java.util.Locale;
 
 /**
@@ -44,33 +45,28 @@ final class HostSettingsDialog extends Dialog {
 
     private final Activity host;
     private final SharedPreferences preferences;
+    private final SafePreferences safePreferences;
     private LinearLayout content;
     private TextView adCleanValue;
     private View imageAdaptiveContainer;
     private boolean adPage;
 
-    HostSettingsDialog(Activity host, SharedPreferences preferences) {
+    HostSettingsDialog(Activity host, SharedPreferences preferences,
+                       SafePreferences safePreferences) {
         super(host, android.R.style.Theme_Material_Light_NoActionBar);
         this.host = host;
         this.preferences = preferences;
+        this.safePreferences = safePreferences;
         migrateMediaAutoplayPreference();
         setOwnerActivity(host);
     }
 
-    /** 旧版合并开关仅迁移到保留的 GIF 开关。 */
     private void migrateMediaAutoplayPreference() {
-        if (!preferences.contains(Config.KEY_DISABLE_MEDIA_AUTOPLAY)) {
-            return;
-        }
-        boolean oldValue = preferences.getBoolean(
-                Config.KEY_DISABLE_MEDIA_AUTOPLAY, false);
-        SharedPreferences.Editor editor = preferences.edit();
+        safePreferences.migrateGif(preferences);
+    }
 
-        if (!preferences.contains(Config.KEY_DISABLE_GIF_AUTOPLAY)) {
-            editor.putBoolean(Config.KEY_DISABLE_GIF_AUTOPLAY, oldValue);
-        }
-        // GIF 键已经存在或将在本次事务中写入，不迁移已删除的视频开关。
-        editor.remove(Config.KEY_DISABLE_MEDIA_AUTOPLAY).apply();
+    private boolean readBoolean(String key, boolean fallback) {
+        return safePreferences.getBoolean(preferences, key, fallback);
     }
 
     @Override
@@ -218,7 +214,7 @@ final class HostSettingsDialog extends Dialog {
                 "根据网络自适应查看原图", "Wi-Fi自动加载；移动网络保持普通图片",
                 Config.KEY_IMAGE_WIFI_ADAPTIVE, false));
         imageAdaptiveContainer = adaptiveContainer;
-        adaptiveContainer.setVisibility(preferences.getBoolean(
+        adaptiveContainer.setVisibility(readBoolean(
                 Config.KEY_IMAGE_ENHANCE, false) ? View.VISIBLE : View.GONE);
         experienceCard.addView(adaptiveContainer);
         content.addView(experienceCard, cardMargins());
@@ -332,7 +328,7 @@ final class HostSettingsDialog extends Dialog {
         adNote.setTextSize(12);
         adNote.setPadding(dp(12), dp(10), dp(12), 0);
         children.addView(adNote);
-        children.setVisibility(preferences.getBoolean(
+        children.setVisibility(readBoolean(
                 Config.KEY_GLOBAL_AD_CLEAN, false) ? View.VISIBLE : View.GONE);
         page.addView(children);
         root.addView(scrollView, new LinearLayout.LayoutParams(
@@ -344,14 +340,14 @@ final class HostSettingsDialog extends Dialog {
         if (adCleanValue == null) {
             return;
         }
-        if (!preferences.getBoolean(Config.KEY_GLOBAL_AD_CLEAN, false)) {
+        if (!readBoolean(Config.KEY_GLOBAL_AD_CLEAN, false)) {
             adCleanValue.setText("未开启");
             return;
         }
         int enabled = 0;
-        enabled += preferences.getBoolean(Config.KEY_AD_CLEAN_HOME, true) ? 1 : 0;
-        enabled += preferences.getBoolean(Config.KEY_AD_CLEAN_BANNERS, true) ? 1 : 0;
-        enabled += preferences.getBoolean(
+        enabled += readBoolean(Config.KEY_AD_CLEAN_HOME, true) ? 1 : 0;
+        enabled += readBoolean(Config.KEY_AD_CLEAN_BANNERS, true) ? 1 : 0;
+        enabled += readBoolean(
                 Config.KEY_AD_CLEAN_MALL_BOTTOM, true) ? 1 : 0;
         adCleanValue.setText("已开启 · " + enabled + "项");
     }
@@ -424,7 +420,8 @@ final class HostSettingsDialog extends Dialog {
                 new LinearLayout.LayoutParams(
                         0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
         Switch toggle = new Switch(host);
-        toggle.setChecked(preferences.getBoolean(key, defaultValue));
+        toggle.setChecked(readBoolean(key, defaultValue));
+        toggle.setContentDescription(title);
         toggle.setButtonTintList(null);
         toggle.setTrackTintList(new android.content.res.ColorStateList(
                 new int[][]{
@@ -436,8 +433,18 @@ final class HostSettingsDialog extends Dialog {
                 new int[][]{
                         new int[]{android.R.attr.state_checked}, new int[]{}
                 }, new int[]{COLOR_ACCENT, Color.WHITE}));
+        boolean[] restoring = {false};
         toggle.setOnCheckedChangeListener((button, checked) -> {
-            preferences.edit().putBoolean(key, checked).apply();
+            if (restoring[0]) {
+                return;
+            }
+            if (!safePreferences.putBoolean(preferences, key, checked)) {
+                restoring[0] = true;
+                toggle.setChecked(!checked);
+                restoring[0] = false;
+                Toast.makeText(host, "设置保存失败，请重试", Toast.LENGTH_SHORT).show();
+                return;
+            }
             if (listener != null) {
                 listener.onChanged(checked);
             }

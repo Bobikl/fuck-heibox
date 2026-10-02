@@ -55,8 +55,24 @@ class ReviewGuards(unittest.TestCase):
         self.assertIn("applyDailyShareCooldownAndClose(runContext)", body)
 
     def test_migration_preserves_new_values(self):
-        body = section("private void migrateRemotePreferencesIfNeeded(", "private ")
-        self.assertLess(body.index("hostPreferences.contains(key)"), body.index("editor.putString(key"))
+        body = (Path(__file__).resolve().parents[1] / "app/src/main/java/dev/heybox/hook/SafePreferences.java").read_text(encoding="utf-8")
+        self.assertLess(body.index("host.contains(key)"), body.index("editor.putString(key"))
+        self.assertIn("safePreferences.migrate(hostPreferences, legacy)", SOURCE)
+
+    def test_splash_preserves_real_binding_initialization(self):
+        body = section("private void installSplashAdHook(", "private void installGlobalAdHooks(")
+        self.assertNotIn("bindingConstructor", body)
+        self.assertNotIn("splashInitialize", body)
+        self.assertNotIn("continueLaunch.invoke", body)
+        self.assertIn("Modifier.isStatic(selectAd.getModifiers())", body)
+        self.assertIn("com.max.xiaoheihe.bean.AdsInfoObj", body)
+
+    def test_settings_entry_uses_lifecycle_manager_and_safe_reads(self):
+        body = section("private void openModuleSettings(", "private ViewGroup.LayoutParams")
+        self.assertIn("settingsDialogs.open(activity)", body)
+        ui = (Path(__file__).resolve().parents[1] / "app/src/main/java/dev/heybox/hook/HostSettingsDialog.java").read_text(encoding="utf-8")
+        self.assertNotIn("preferences.getBoolean(", ui)
+        self.assertIn("safePreferences.putBoolean(", ui)
 
     def test_original_skip_does_not_clear_failure(self):
         body = section("hook(updateOriginal).intercept", 'info("HOOK_IMAGE_ENHANCE_OK')
