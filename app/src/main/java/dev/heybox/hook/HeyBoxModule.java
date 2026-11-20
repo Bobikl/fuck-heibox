@@ -356,6 +356,9 @@ public final class HeyBoxModule extends XposedModule {
         if (disableClipboardTokenSnapshot) {
             installClipboardTokenHook(classLoader);
         }
+        if (isEnabled(Config.KEY_SILENT_MESSAGES, false)) {
+            installSilentMessagesHook(classLoader);
+        }
         if (externalBrowserSnapshot) {
             installExternalBrowserHooks(classLoader);
         }
@@ -2747,6 +2750,50 @@ public final class HeyBoxModule extends XposedModule {
             info("HOOK_CLIPBOARD_TOKEN_OK method=CopyedTokenManager.c");
         } catch (Throwable throwable) {
             error("HOOK_CLIPBOARD_TOKEN_ERROR", throwable);
+        }
+    }
+
+    private void installSilentMessagesHook(ClassLoader classLoader) {
+        try {
+            Class<?> adapterClass = Class.forName(
+                    "com.max.xiaoheihe.module.bbs.messagecenter."
+                            + "MessageCenterFragment$initViews$msgListAdapter$1",
+                    false, classLoader);
+            Class<?> holderClass = Class.forName(
+                    "com.max.hbcommon.base.adapter.s$e", false, classLoader);
+            Class<?> messageClass = Class.forName(
+                    "com.max.xiaoheihe.bean.bbs.BBSUserMsgObj", false, classLoader);
+            Class<?> badgeClass = Class.forName(
+                    "com.flyco.tablayout.widget.MsgView", false, classLoader);
+            Method bindMessage = adapterClass.getDeclaredMethod("C", holderClass, messageClass);
+            requireVoidReturn(bindMessage);
+            Method getEntry = messageClass.getDeclaredMethod("getEntry");
+            Method findView = holderClass.getDeclaredMethod("i", int.class);
+            int badgeId = targetContext.getResources().getIdentifier("badge", "id", TARGET_PACKAGE);
+            if (badgeId == 0 || getEntry.getReturnType() != String.class
+                    || !View.class.isAssignableFrom(findView.getReturnType())) {
+                warn("HOOK_SILENT_MESSAGES_SKIP incompatible message row");
+                return;
+            }
+            hook(bindMessage).intercept(chain -> {
+                Object result = chain.proceed();
+                try {
+                    String entry = (String) getEntry.invoke(chain.getArg(1));
+                    if ("official_message".equals(entry) || "official_msg_v2".equals(entry)
+                            || "discount".equalsIgnoreCase(entry)) {
+                        Object badge = findView.invoke(chain.getArg(0), badgeId);
+                        if (badgeClass.isInstance(badge)) {
+                            ((View) badge).setVisibility(View.GONE);
+                        }
+                    }
+                } catch (ReflectiveOperationException exception) {
+                    recordRuntimeFallback("静默消息", exception);
+                }
+                return result;
+            });
+            info("HOOK_SILENT_MESSAGES_OK");
+        } catch (Throwable throwable) {
+            error("HOOK_SILENT_MESSAGES_ERROR", throwable);
         }
     }
 

@@ -31,8 +31,8 @@ android {
         applicationId = "dev.heybox.hook"
         minSdk = 26
         targetSdk = 35
-        versionCode = 38
-        versionName = "0.8.5"
+        versionCode = 40
+        versionName = "0.8.7"
     }
 
     val fixedReleaseSigning = if (releaseSigningConfigured) {

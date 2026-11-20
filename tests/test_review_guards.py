@@ -1,8 +1,10 @@
 """Static regression guards, not Android/LSPosed behavioral tests."""
 from pathlib import Path
+import re
 import unittest
 
-SOURCE = (Path(__file__).resolve().parents[1] / "app/src/main/java/dev/heybox/hook/HeyBoxModule.java").read_text(encoding="utf-8")
+SOURCE_PATH = Path(__file__).resolve().parents[1] / "app/src/main/java/dev/heybox/hook/HeyBoxModule.java"
+SOURCE = SOURCE_PATH.read_text(encoding="utf-8")
 
 
 def section(start, end):
@@ -73,6 +75,57 @@ class ReviewGuards(unittest.TestCase):
         ui = (Path(__file__).resolve().parents[1] / "app/src/main/java/dev/heybox/hook/HostSettingsDialog.java").read_text(encoding="utf-8")
         self.assertNotIn("preferences.getBoolean(", ui)
         self.assertIn("safePreferences.putBoolean(", ui)
+
+    def test_silent_messages_is_opt_in(self):
+        body = section("private void initializeTarget(", "private void migrateRemotePreferencesIfNeeded(")
+        self.assertIn("if (isEnabled(Config.KEY_SILENT_MESSAGES, false)) {\n"
+                      "            installSilentMessagesHook(classLoader);", body)
+        ui = (Path(__file__).resolve().parents[1] / "app/src/main/java/dev/heybox/hook/HostSettingsDialog.java").read_text(encoding="utf-8")
+        self.assertIn("Config.KEY_SILENT_MESSAGES, false", ui)
+
+    def test_silent_messages_is_scoped_to_badge_after_binding(self):
+        body = section("private void installSilentMessagesHook(", "private void installExternalBrowserHooks(")
+        self.assertIn("MessageCenterFragment$initViews$msgListAdapter$1", body)
+        self.assertIn('getDeclaredMethod("C", holderClass, messageClass)', body)
+        self.assertEqual(body.count("chain.proceed()"), 1)
+        self.assertLess(body.index("chain.proceed()"), body.index("setVisibility(View.GONE)"))
+        self.assertIn('getIdentifier("badge", "id", TARGET_PACKAGE)', body)
+        self.assertIn('if ("official_message".equals(entry) || "official_msg_v2".equals(entry)\n'
+                      '                            || "discount".equalsIgnoreCase(entry)) {', body)
+        self.assertNotIn("setCount", body)
+
+    def test_settings_follow_system_dark_mode(self):
+        ui = Path(SOURCE_PATH.parent, "HostSettingsDialog.java").read_text(encoding="utf-8")
+        self.assertIn("uiModeManager.getNightMode()", ui)
+        self.assertIn("Resources.getSystem().getConfiguration().uiMode", ui)
+        self.assertIn("uiMode & Configuration.UI_MODE_NIGHT_MASK", ui)
+        self.assertIn("darkMode ? android.R.style.Theme_Material_NoActionBar", ui)
+        self.assertIn("Switch toggle = new Switch(getContext())", ui)
+        self.assertIn("int lightBarFlags = darkMode ? 0", ui)
+        self.assertIn("window.setStatusBarColor(cardColor)", ui)
+        self.assertIn("window.setNavigationBarColor(backgroundColor)", ui)
+
+    def test_settings_text_contrast_in_both_palettes(self):
+        ui = Path(SOURCE_PATH.parent, "HostSettingsDialog.java").read_text(encoding="utf-8")
+
+        def luminance(color):
+            if color == "Color.WHITE":
+                return 1.0
+            rgb = [int(color[i:i + 2], 16) / 255 for i in (4, 6, 8)]
+            linear = [c / 12.92 if c <= 0.04045 else ((c + 0.055) / 1.055) ** 2.4
+                      for c in rgb]
+            return sum(c * weight for c, weight in zip(linear, (0.2126, 0.7152, 0.0722)))
+
+        def palette(name):
+            values = re.search(rf"{name} = darkMode \? (\S+) : (\S+);", ui)
+            self.assertIsNotNone(values, name)
+            return [luminance(value) for value in values.groups()]
+
+        for text_color in ("primaryColor", "secondaryColor"):
+            for surface in ("cardColor", "backgroundColor"):
+                for text, background in zip(palette(text_color), palette(surface)):
+                    ratio = (max(text, background) + 0.05) / (min(text, background) + 0.05)
+                    self.assertGreaterEqual(ratio, 4.5, (text_color, surface))
 
     def test_original_skip_does_not_clear_failure(self):
         body = section("hook(updateOriginal).intercept", 'info("HOOK_IMAGE_ENHANCE_OK')

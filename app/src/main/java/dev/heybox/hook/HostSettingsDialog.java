@@ -2,8 +2,11 @@ package dev.heybox.hook;
 
 import android.app.Activity;
 import android.app.Dialog;
+import android.app.UiModeManager;
 import android.content.Context;
 import android.content.SharedPreferences;
+import android.content.res.Configuration;
+import android.content.res.Resources;
 import android.graphics.Color;
 import android.graphics.Typeface;
 import android.graphics.drawable.ColorDrawable;
@@ -36,16 +39,17 @@ final class HostSettingsDialog extends Dialog {
         void onChanged(boolean checked);
     }
 
-    private static final int COLOR_BACKGROUND = Color.rgb(245, 246, 248);
-    private static final int COLOR_CARD = Color.WHITE;
-    private static final int COLOR_PRIMARY = Color.rgb(28, 29, 33);
-    private static final int COLOR_SECONDARY = Color.rgb(139, 142, 151);
     private static final int COLOR_ACCENT = Color.rgb(247, 193, 35);
-    private static final int COLOR_DIVIDER = Color.rgb(237, 238, 241);
 
     private final Activity host;
     private final SharedPreferences preferences;
     private final SafePreferences safePreferences;
+    private final boolean darkMode;
+    private final int backgroundColor;
+    private final int cardColor;
+    private final int primaryColor;
+    private final int secondaryColor;
+    private final int dividerColor;
     private LinearLayout content;
     private TextView adCleanValue;
     private View imageAdaptiveContainer;
@@ -53,12 +57,35 @@ final class HostSettingsDialog extends Dialog {
 
     HostSettingsDialog(Activity host, SharedPreferences preferences,
                        SafePreferences safePreferences) {
-        super(host, android.R.style.Theme_Material_Light_NoActionBar);
+        this(host, preferences, safePreferences, isSystemDarkMode(host));
+    }
+
+    private HostSettingsDialog(Activity host, SharedPreferences preferences,
+                               SafePreferences safePreferences, boolean darkMode) {
+        super(host, darkMode ? android.R.style.Theme_Material_NoActionBar
+                : android.R.style.Theme_Material_Light_NoActionBar);
         this.host = host;
         this.preferences = preferences;
         this.safePreferences = safePreferences;
+        this.darkMode = darkMode;
+        backgroundColor = darkMode ? 0xff121316 : 0xfff5f6f8;
+        cardColor = darkMode ? 0xff202126 : Color.WHITE;
+        primaryColor = darkMode ? 0xfff0f1f4 : 0xff1c1d21;
+        secondaryColor = darkMode ? 0xffb0b4bf : 0xff626772;
+        dividerColor = darkMode ? 0xff353740 : 0xffedeef1;
         migrateMediaAutoplayPreference();
         setOwnerActivity(host);
+    }
+
+    private static boolean isSystemDarkMode(Context context) {
+        UiModeManager uiModeManager = context.getSystemService(UiModeManager.class);
+        int mode = uiModeManager == null ? -1 : uiModeManager.getNightMode();
+        // 小黑盒可单独覆盖应用的夜间模式。设置页读取系统选择和当前生效的配置。
+        if (mode == UiModeManager.MODE_NIGHT_YES || mode == UiModeManager.MODE_NIGHT_NO) {
+            return mode == UiModeManager.MODE_NIGHT_YES;
+        }
+        int uiMode = Resources.getSystem().getConfiguration().uiMode;
+        return (uiMode & Configuration.UI_MODE_NIGHT_MASK) == Configuration.UI_MODE_NIGHT_YES;
     }
 
     private void migrateMediaAutoplayPreference() {
@@ -106,19 +133,23 @@ final class HostSettingsDialog extends Dialog {
         if (window == null) {
             return;
         }
-        window.setBackgroundDrawable(new ColorDrawable(Color.WHITE));
+        window.setBackgroundDrawable(new ColorDrawable(cardColor));
         window.clearFlags(WindowManager.LayoutParams.FLAG_DIM_BEHIND
                 | WindowManager.LayoutParams.FLAG_TRANSLUCENT_STATUS
                 | WindowManager.LayoutParams.FLAG_TRANSLUCENT_NAVIGATION);
-        window.setStatusBarColor(Color.WHITE);
-        window.setNavigationBarColor(Color.WHITE);
+        window.setStatusBarColor(cardColor);
+        window.setNavigationBarColor(backgroundColor);
+        View decor = window.getDecorView();
+        if (Build.VERSION.SDK_INT >= 29) {
+            decor.setForceDarkAllowed(false);
+        }
         if (Build.VERSION.SDK_INT >= 30) {
             window.setDecorFitsSystemWindows(false);
         }
-        window.getDecorView().setSystemUiVisibility(
-                View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR
-                        | View.SYSTEM_UI_FLAG_LIGHT_NAVIGATION_BAR
-                        | View.SYSTEM_UI_FLAG_LAYOUT_STABLE
+        int lightBarFlags = darkMode ? 0
+                : View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR | View.SYSTEM_UI_FLAG_LIGHT_NAVIGATION_BAR;
+        decor.setSystemUiVisibility(
+                lightBarFlags | View.SYSTEM_UI_FLAG_LAYOUT_STABLE
                         | View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN
                         | View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION);
         window.setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE);
@@ -143,10 +174,10 @@ final class HostSettingsDialog extends Dialog {
                 new LinearLayout.LayoutParams(
                         ViewGroup.LayoutParams.MATCH_PARENT, dp(56)));
 
-        ScrollView scrollView = new ScrollView(host);
+        ScrollView scrollView = new ScrollView(getContext());
         scrollView.setFillViewport(true);
         scrollView.setClipToPadding(false);
-        content = new LinearLayout(host);
+        content = new LinearLayout(getContext());
         content.setOrientation(LinearLayout.VERTICAL);
         content.setPadding(dp(14), dp(8), dp(14), dp(32));
         scrollView.addView(content, new ScrollView.LayoutParams(
@@ -168,6 +199,10 @@ final class HostSettingsDialog extends Dialog {
         cleanCard.addView(createSwitchRow(
                 "禁止读取剪贴板口令", "阻止小黑盒启动或回前台时扫描剪贴板",
                 Config.KEY_DISABLE_CLIPBOARD_TOKEN, false));
+        cleanCard.addView(createDivider());
+        cleanCard.addView(createSwitchRow(
+                "静默消息", "隐藏消息中心里官方消息和游戏优惠的红点",
+                Config.KEY_SILENT_MESSAGES, false));
         content.addView(cleanCard, cardMargins());
 
         addSectionLabel("任务功能");
@@ -207,7 +242,7 @@ final class HostSettingsDialog extends Dialog {
                                 checked ? View.VISIBLE : View.GONE);
                     }
                 }));
-        LinearLayout adaptiveContainer = new LinearLayout(host);
+        LinearLayout adaptiveContainer = new LinearLayout(getContext());
         adaptiveContainer.setOrientation(LinearLayout.VERTICAL);
         adaptiveContainer.addView(createDivider());
         adaptiveContainer.addView(createSwitchRow(
@@ -226,9 +261,9 @@ final class HostSettingsDialog extends Dialog {
                 Config.KEY_SUPPRESS_UPDATE_PROMPT, false));
         content.addView(versionCard, cardMargins());
 
-        TextView note = new TextView(host);
+        TextView note = new TextView(getContext());
         note.setText("设置直接保存在小黑盒进程中。全部功能默认关闭；修改后请彻底重启小黑盒，关闭的功能不会安装对应 Hook。");
-        note.setTextColor(COLOR_SECONDARY);
+        note.setTextColor(secondaryColor);
         note.setTextSize(12);
         note.setLineSpacing(dp(2), 1f);
         LinearLayout.LayoutParams noteParams = new LinearLayout.LayoutParams(
@@ -243,9 +278,9 @@ final class HostSettingsDialog extends Dialog {
     }
 
     private LinearLayout createInsetRoot() {
-        LinearLayout root = new LinearLayout(host);
+        LinearLayout root = new LinearLayout(getContext());
         root.setOrientation(LinearLayout.VERTICAL);
-        root.setBackgroundColor(COLOR_BACKGROUND);
+        root.setBackgroundColor(backgroundColor);
         root.setOnApplyWindowInsetsListener((view, insets) -> {
             int top = insets.getSystemWindowInsetTop();
             if (Build.VERSION.SDK_INT >= 28 && insets.getDisplayCutout() != null) {
@@ -270,8 +305,8 @@ final class HostSettingsDialog extends Dialog {
                 "全局广告净化", "进入二级页面选择需要净化的广告类型");
         row.addView(column, new LinearLayout.LayoutParams(
                 0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
-        adCleanValue = new TextView(host);
-        adCleanValue.setTextColor(COLOR_SECONDARY);
+        adCleanValue = new TextView(getContext());
+        adCleanValue.setTextColor(secondaryColor);
         adCleanValue.setTextSize(13);
         adCleanValue.setGravity(Gravity.CENTER_VERTICAL | Gravity.END);
         row.addView(adCleanValue, new LinearLayout.LayoutParams(
@@ -288,9 +323,9 @@ final class HostSettingsDialog extends Dialog {
         root.addView(createTitleBar("广告净化", this::showMainPage),
                 new LinearLayout.LayoutParams(
                         ViewGroup.LayoutParams.MATCH_PARENT, dp(56)));
-        ScrollView scrollView = new ScrollView(host);
+        ScrollView scrollView = new ScrollView(getContext());
         scrollView.setFillViewport(true);
-        LinearLayout page = new LinearLayout(host);
+        LinearLayout page = new LinearLayout(getContext());
         page.setOrientation(LinearLayout.VERTICAL);
         page.setPadding(dp(14), dp(8), dp(14), dp(32));
         scrollView.addView(page, new ScrollView.LayoutParams(
@@ -299,7 +334,7 @@ final class HostSettingsDialog extends Dialog {
 
         page.addView(createSectionLabelView("总开关"));
         LinearLayout masterCard = createCard();
-        LinearLayout children = new LinearLayout(host);
+        LinearLayout children = new LinearLayout(getContext());
         children.setOrientation(LinearLayout.VERTICAL);
         masterCard.addView(createSwitchRow(
                 "开启净化", "只安装下方选中项目的 Hook，开屏广告使用独立开关",
@@ -322,9 +357,9 @@ final class HostSettingsDialog extends Dialog {
                 "商城底栏广告", "移除商城页面底部浮动广告栏",
                 Config.KEY_AD_CLEAN_MALL_BOTTOM, true));
         children.addView(childCard, cardMargins());
-        TextView adNote = new TextView(host);
+        TextView adNote = new TextView(getContext());
         adNote.setText("总开关关闭时不会安装广告净化 Hook；子项选择会保留。更改后请重启小黑盒。");
-        adNote.setTextColor(COLOR_SECONDARY);
+        adNote.setTextColor(secondaryColor);
         adNote.setTextSize(12);
         adNote.setPadding(dp(12), dp(10), dp(12), 0);
         children.addView(adNote);
@@ -355,12 +390,12 @@ final class HostSettingsDialog extends Dialog {
 
 
     private FrameLayout createTitleBar(String titleText, Runnable backAction) {
-        FrameLayout bar = new FrameLayout(host);
-        bar.setBackgroundColor(Color.WHITE);
-        TextView back = new TextView(host);
+        FrameLayout bar = new FrameLayout(getContext());
+        bar.setBackgroundColor(cardColor);
+        TextView back = new TextView(getContext());
         back.setText("‹");
         back.setTextSize(40);
-        back.setTextColor(COLOR_PRIMARY);
+        back.setTextColor(primaryColor);
         back.setGravity(Gravity.CENTER);
         back.setContentDescription("返回");
         back.setOnClickListener(view -> backAction.run());
@@ -368,9 +403,9 @@ final class HostSettingsDialog extends Dialog {
                 dp(52), dp(56));
         backParams.gravity = Gravity.START | Gravity.CENTER_VERTICAL;
         bar.addView(back, backParams);
-        TextView title = new TextView(host);
+        TextView title = new TextView(getContext());
         title.setText(titleText);
-        title.setTextColor(COLOR_PRIMARY);
+        title.setTextColor(primaryColor);
         title.setTextSize(18);
         title.setTypeface(Typeface.DEFAULT, Typeface.BOLD);
         title.setGravity(Gravity.CENTER);
@@ -387,19 +422,19 @@ final class HostSettingsDialog extends Dialog {
     }
 
     private TextView createSectionLabelView(String label) {
-        TextView view = new TextView(host);
+        TextView view = new TextView(getContext());
         view.setText(label);
-        view.setTextColor(COLOR_SECONDARY);
+        view.setTextColor(secondaryColor);
         view.setTextSize(13);
         view.setPadding(dp(10), dp(16), 0, dp(8));
         return view;
     }
 
     private LinearLayout createCard() {
-        LinearLayout card = new LinearLayout(host);
+        LinearLayout card = new LinearLayout(getContext());
         card.setOrientation(LinearLayout.VERTICAL);
         GradientDrawable background = new GradientDrawable();
-        background.setColor(COLOR_CARD);
+        background.setColor(cardColor);
         background.setCornerRadius(dp(10));
         card.setBackground(background);
         card.setClipToOutline(true);
@@ -419,7 +454,7 @@ final class HostSettingsDialog extends Dialog {
         row.addView(createTextColumn(title, subtitle),
                 new LinearLayout.LayoutParams(
                         0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
-        Switch toggle = new Switch(host);
+        Switch toggle = new Switch(getContext());
         toggle.setChecked(readBoolean(key, defaultValue));
         toggle.setContentDescription(title);
         toggle.setButtonTintList(null);
@@ -427,12 +462,12 @@ final class HostSettingsDialog extends Dialog {
                 new int[][]{
                         new int[]{android.R.attr.state_checked}, new int[]{}
                 }, new int[]{
-                        withAlpha(COLOR_ACCENT, 120), Color.rgb(211, 213, 218)
+                        withAlpha(COLOR_ACCENT, 120), darkMode ? 0xff51545c : 0xffd3d5da
                 }));
         toggle.setThumbTintList(new android.content.res.ColorStateList(
                 new int[][]{
                         new int[]{android.R.attr.state_checked}, new int[]{}
-                }, new int[]{COLOR_ACCENT, Color.WHITE}));
+                }, new int[]{COLOR_ACCENT, darkMode ? 0xffd2d4d9 : Color.WHITE}));
         boolean[] restoring = {false};
         toggle.setOnCheckedChangeListener((button, checked) -> {
             if (restoring[0]) {
@@ -457,7 +492,7 @@ final class HostSettingsDialog extends Dialog {
     }
 
     private LinearLayout createBaseRow() {
-        LinearLayout row = new LinearLayout(host);
+        LinearLayout row = new LinearLayout(getContext());
         row.setOrientation(LinearLayout.HORIZONTAL);
         row.setGravity(Gravity.CENTER_VERTICAL);
         row.setPadding(dp(16), dp(9), dp(12), dp(9));
@@ -466,17 +501,17 @@ final class HostSettingsDialog extends Dialog {
     }
 
     private LinearLayout createTextColumn(String title, String subtitle) {
-        LinearLayout column = new LinearLayout(host);
+        LinearLayout column = new LinearLayout(getContext());
         column.setOrientation(LinearLayout.VERTICAL);
         column.setGravity(Gravity.CENTER_VERTICAL);
-        TextView titleView = new TextView(host);
+        TextView titleView = new TextView(getContext());
         titleView.setText(title);
-        titleView.setTextColor(COLOR_PRIMARY);
+        titleView.setTextColor(primaryColor);
         titleView.setTextSize(16);
         column.addView(titleView);
-        TextView subtitleView = new TextView(host);
+        TextView subtitleView = new TextView(getContext());
         subtitleView.setText(subtitle);
-        subtitleView.setTextColor(COLOR_SECONDARY);
+        subtitleView.setTextColor(secondaryColor);
         subtitleView.setTextSize(12);
         LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
@@ -487,8 +522,8 @@ final class HostSettingsDialog extends Dialog {
     }
 
     private View createDivider() {
-        View divider = new View(host);
-        divider.setBackgroundColor(COLOR_DIVIDER);
+        View divider = new View(getContext());
+        divider.setBackgroundColor(dividerColor);
         LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, dp(1));
         params.leftMargin = dp(16);
@@ -497,18 +532,18 @@ final class HostSettingsDialog extends Dialog {
     }
 
     private TextView createArrow() {
-        TextView arrow = new TextView(host);
+        TextView arrow = new TextView(getContext());
         arrow.setText("  ›");
-        arrow.setTextColor(Color.rgb(188, 190, 196));
+        arrow.setTextColor(secondaryColor);
         arrow.setTextSize(26);
         arrow.setGravity(Gravity.CENTER);
         return arrow;
     }
 
     private TextView createPlainActionRow(String text) {
-        TextView action = new TextView(host);
+        TextView action = new TextView(getContext());
         action.setText(text);
-        action.setTextColor(COLOR_PRIMARY);
+        action.setTextColor(primaryColor);
         action.setTextSize(14);
         action.setTypeface(Typeface.DEFAULT, Typeface.BOLD);
         action.setGravity(Gravity.CENTER);
@@ -518,8 +553,8 @@ final class HostSettingsDialog extends Dialog {
     }
 
     private TextView createInfoRow(String title, String value) {
-        TextView view = new TextView(host);
-        view.setTextColor(COLOR_SECONDARY);
+        TextView view = new TextView(getContext());
+        view.setTextColor(secondaryColor);
         view.setTextSize(13);
         view.setGravity(Gravity.CENTER_VERTICAL);
         view.setPadding(dp(16), dp(12), dp(16), dp(12));
